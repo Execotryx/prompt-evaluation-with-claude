@@ -1,0 +1,42 @@
+[
+    {
+        "task": "Parse an AWS CloudFormation template in JSON format and extract all resource logical IDs",
+        "solution": "To parse an AWS CloudFormation template and extract all resource logical IDs:\n\n```python\nimport json\n\ndef extract_resource_logical_ids(template_path):\n    with open(template_path, 'r') as file:\n        template = json.load(file)\n    return list(template['Resources'].keys())\n```\n\nFor a CloudFormation template like:\n```json\n{\n  \"Resources\": {\n    \"MyBucket\": {\"Type\": \"AWS::S3::Bucket\"},\n    \"MyRole\": {\"Type\": \"AWS::IAM::Role\"},\n    \"MyInstance\": {\"Type\": \"AWS::EC2::Instance\"}\n  }\n}\n```\n\nThe function returns: `['MyBucket', 'MyRole', 'MyInstance']`\n\nOr in JavaScript:\n```javascript\nfunction extractResourceLogicalIds(template) {\n    return Object.keys(template.Resources);\n}\n```"
+    },
+    {
+        "task": "Write a Python function to validate AWS S3 bucket names according to AWS naming rules",
+        "solution": "import re\n\ndef validate_s3_bucket_name(bucket_name):\n    \"\"\"\n    Validate AWS S3 bucket names according to AWS naming rules.\n    \n    Rules:\n    - Must be between 3 and 63 characters long\n    - Can only contain lowercase letters, numbers, and hyphens\n    - Must start with a lowercase letter or number\n    - Must end with a lowercase letter or number\n    \n    Args:\n        bucket_name (str): The bucket name to validate\n        \n    Returns:\n        bool: True if valid, False otherwise\n    \"\"\"\n    if not isinstance(bucket_name, str):\n        return False\n    \n    # Check length and pattern: 3-63 chars, lowercase/numbers/hyphens, starts and ends with alphanumeric\n    return bool(re.match(r'^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$', bucket_name))\n\n\n# Test cases\nif __name__ == '__main__':\n    test_cases = [\n        ('my-bucket', True),\n        ('mybucket123', True),\n        ('a1b2c3', True),\n        ('my', False),  # Too short\n        ('my-bucket-with-a-very-long-name-that-exceeds-sixty-three-characters-limit', False),  # Too long\n        ('MyBucket', False),  # Contains uppercase\n        ('my_bucket', False),  # Contains underscore\n        ('my-bucket-', False),  # Ends with hyphen\n        ('-my-bucket', False),  # Starts with hyphen\n        ('my--bucket', False),  # Consecutive hyphens\n        ('192.168.1.1', False),  # IP address format\n        ('', False),  # Empty string\n        ('bucket.name', False),  # Contains dot\n        ('1bucket', True),  # Starts with number\n        ('bucket1', True),  # Ends with number\n    ]\n    \n    for bucket_name, expected in test_cases:\n        result = validate_s3_bucket_name(bucket_name)\n        status = '\u2713' if result == expected else '\u2717'\n        print(f'{status} {bucket_name!r}: {result} (expected {expected})')"
+    },
+    {
+        "task": "Create a regex pattern to match valid AWS IAM role ARNs",
+        "solution": "^arn:aws:iam::(\\d{12}):role/(.+)$"
+    },
+    {
+        "task": "Write a Python function to convert AWS EC2 instance types to their vCPU and memory specifications",
+        "solution": "def get_ec2_specs(instance_type: str) -> dict:\n    \"\"\"\n    Convert AWS EC2 instance type to vCPU and memory specifications.\n    \n    Args:\n        instance_type: EC2 instance type string (e.g., 't3.medium')\n    \n    Returns:\n        Dictionary with 'vcpu' and 'memory_gb' keys\n    \"\"\"\n    ec2_specs = {\n        't3.nano': {'vcpu': 2, 'memory_gb': 0.5},\n        't3.micro': {'vcpu': 2, 'memory_gb': 1},\n        't3.small': {'vcpu': 2, 'memory_gb': 2},\n        't3.medium': {'vcpu': 2, 'memory_gb': 4},\n        't3.large': {'vcpu': 2, 'memory_gb': 8},\n        't3.xlarge': {'vcpu': 4, 'memory_gb': 16},\n        't3.2xlarge': {'vcpu': 8, 'memory_gb': 32},\n        't2.micro': {'vcpu': 1, 'memory_gb': 1},\n        't2.small': {'vcpu': 1, 'memory_gb': 2},\n        't2.medium': {'vcpu': 2, 'memory_gb': 4},\n        't2.large': {'vcpu': 2, 'memory_gb': 8},\n        'm5.large': {'vcpu': 2, 'memory_gb': 8},\n        'm5.xlarge': {'vcpu': 4, 'memory_gb': 16},\n        'm5.2xlarge': {'vcpu': 8, 'memory_gb': 32},\n        'c5.large': {'vcpu': 2, 'memory_gb': 4},\n        'c5.xlarge': {'vcpu': 4, 'memory_gb': 8},\n        'c5.2xlarge': {'vcpu': 8, 'memory_gb': 16},\n    }\n    \n    if instance_type in ec2_specs:\n        return ec2_specs[instance_type]\n    raise ValueError(f\"Unknown EC2 instance type: {instance_type}\")"
+    },
+    {
+        "task": "Create a JSON schema that validates AWS Lambda function configuration objects",
+        "solution": "{\"$schema\": \"http://json-schema.org/draft-07/schema#\", \"type\": \"object\", \"title\": \"AWS Lambda Function Configuration\", \"required\": [\"FunctionName\", \"Runtime\", \"Handler\", \"Role\"], \"properties\": {\"FunctionName\": {\"type\": \"string\", \"minLength\": 1}, \"Runtime\": {\"type\": \"string\"}, \"Handler\": {\"type\": \"string\", \"minLength\": 1}, \"Role\": {\"type\": \"string\"}, \"Description\": {\"type\": \"string\"}, \"Timeout\": {\"type\": \"integer\", \"minimum\": 1, \"maximum\": 900}, \"MemorySize\": {\"type\": \"integer\", \"minimum\": 128, \"maximum\": 10240}, \"Environment\": {\"type\": \"object\"}, \"Tags\": {\"type\": \"object\"}}, \"additionalProperties\": false}"
+    },
+    {
+        "task": "Write a regex pattern to extract AWS access key IDs from log files",
+        "solution": "AKIA[0-9A-Z]{16}"
+    },
+    {
+        "task": "Write a Python function to parse AWS CloudWatch log timestamps and convert them to a human-readable format",
+        "solution": "from datetime import datetime\n\ndef parse_cloudwatch_timestamp(timestamp_ms):\n    \"\"\"\n    Parse AWS CloudWatch log timestamp (Unix timestamp in milliseconds)\n    and convert to human-readable format.\n    \n    Args:\n        timestamp_ms (int): Unix timestamp in milliseconds\n        \n    Returns:\n        str: Formatted datetime string\n    \"\"\"\n    dt = datetime.utcfromtimestamp(timestamp_ms / 1000)\n    return dt.strftime('%Y-%m-%d %H:%M:%S UTC')\n\n\n# Test cases\nif __name__ == \"__main__\":\n    test_timestamps = [1609459200000, 1640995200000, 1672531200000, 1704067200000]\n    \n    for ts in test_timestamps:\n        print(f\"{ts} -> {parse_cloudwatch_timestamp(ts)}\")"
+    },
+    {
+        "task": "Create a regex pattern to validate AWS RDS database endpoint URLs",
+        "solution": "^(?P<identifier>[a-z0-9][a-z0-9-]*)\\.(?P<region>[a-z]{2}-[a-z]+-\\d)\\.rds\\.amazonaws\\.com$"
+    },
+    {
+        "task": "Write a Python function to calculate AWS S3 storage costs based on storage class and GB stored",
+        "solution": "def calculate_s3_storage_cost(storage_class, gb_stored):\n    \"\"\"\n    Calculate AWS S3 storage costs based on storage class and GB stored.\n    \n    Args:\n        storage_class (str): The S3 storage class (e.g., 'STANDARD', 'INTELLIGENT_TIERING', 'GLACIER_FLEXIBLE', etc.)\n        gb_stored (float): Amount of data stored in GB\n    \n    Returns:\n        float: Estimated monthly cost in USD\n    \"\"\"\n    \n    # AWS S3 pricing per GB per month (US East region)\n    pricing = {\n        'STANDARD': 0.023,\n        'INTELLIGENT_TIERING': 0.0125,\n        'STANDARD_IA': 0.0125,\n        'ONEZONE_IA': 0.01,\n        'GLACIER_IR': 0.004,\n        'GLACIER_FLEXIBLE': 0.0036,\n        'DEEP_ARCHIVE': 0.00099\n    }\n    \n    if storage_class not in pricing:\n        raise ValueError(f\"Unknown storage class: {storage_class}\")\n    \n    return round(gb_stored * pricing[storage_class], 2)\n\n\n# Example usage\nif __name__ == \"__main__\":\n    print(calculate_s3_storage_cost('STANDARD', 100))  # $2.3/month\n    print(calculate_s3_storage_cost('GLACIER_FLEXIBLE', 1000))  # $3.6/month\n    print(calculate_s3_storage_cost('DEEP_ARCHIVE', 10000))  # $9.9/month\n"
+    },
+    {
+        "task": "Create a JSON configuration object for an AWS Systems Manager Parameter Store entry with encryption and tagging",
+        "solution": "{\"Name\": \"/app/db/password\", \"Value\": \"SecurePass123!\", \"Type\": \"SecureString\", \"KmsKeyId\": \"arn:aws:kms:us-east-1:123456789012:key/12345678-1234-1234-1234-123456789012\", \"Tags\": {\"Environment\": \"Production\", \"Owner\": \"DevOps\"}}"
+    }
+]

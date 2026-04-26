@@ -1,0 +1,11 @@
+[project]
+name = "prompt-evaluation"
+version = "0.1.0"
+description = "Iterative prompt evaluation pipeline that generates, evaluates, and refines AWS coding task criteria using the Claude API"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.94.0",
+    "python-dotenv>=1.2.2",
+    "tqdm>=4.67.0",
+]
