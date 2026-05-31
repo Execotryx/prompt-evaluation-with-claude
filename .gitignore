@@ -14,3 +14,6 @@ wheels/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+
+
+refined_*.json

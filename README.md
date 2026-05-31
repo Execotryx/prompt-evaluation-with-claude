@@ -77,6 +77,14 @@ The LangGraph agent always refines from the **best-scoring dataset seen so far**
 
 `build_prompt_evaluation_agent(checkpoint_db)` builds the compiled LangGraph app. The graph state tracks datasets, solutions, evaluations, best score, iteration count, stagnation count, current stage, errors, stop reason, and artifact paths.
 
+Graph construction is split into small helpers:
+
+- `_add_graph_nodes(workflow)` registers the node functions.
+- `_add_stage_edges(workflow)` wires deterministic and conditional routes from shared route tables.
+- `_compile_graph(workflow, checkpoint_db)` attaches the SQLite checkpointer and compiles the app.
+
+Node state updates use `_stage_success(...)` and `_node_error(...)` so stale error fields are cleared consistently. Initial and refined solution/evaluation stages share `_generate_solutions_node(...)` and `_evaluate_solutions_node(...)`, with only the artifact path changing between initial and refined runs.
+
 ## Output Files
 
 | File | Description |
@@ -89,3 +97,17 @@ The LangGraph agent always refines from the **best-scoring dataset seen so far**
 | `refined_evaluation_results_N.json` | Evaluation results for iteration N |
 | `best_dataset.json` | Best-scoring dataset across all iterations |
 | `langgraph_checkpoints.sqlite` | Default SQLite checkpoint database for LangGraph orchestration state |
+
+## Development
+
+Use type hints for Python code and Google-style docstrings for public functions, methods, classes, and non-trivial private helpers. Docstrings should include `Args:`, `Returns:`, and `Raises:` when applicable.
+
+Run the checks before handing off changes:
+
+```bash
+uv run --python C:\Users\Execotryx\AppData\Local\Programs\Python\Python313\python.exe pyright
+uv run --python C:\Users\Execotryx\AppData\Local\Programs\Python\Python313\python.exe python -m py_compile main.py tests\test_langgraph_agent.py
+uv run --python C:\Users\Execotryx\AppData\Local\Programs\Python\Python313\python.exe python -m unittest discover -s tests
+```
+
+The tests cover graph routing, cache reuse, max-token correction, checkpoint error recovery, and the shared initial/refined solution and evaluation node helpers.
