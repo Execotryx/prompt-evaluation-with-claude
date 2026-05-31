@@ -1,143 +1,142 @@
 [
     {
-        "score": 6,
+        "score": 7.5,
         "strengths": [
-            "Simple and straightforward implementation that correctly extracts logical IDs from the Resources section",
-            "Provides both Python and JavaScript examples showing language flexibility",
-            "Works correctly for well-formed CloudFormation templates with the expected structure"
+            "Correctly uses json.loads to parse the CloudFormation template string and extracts keys from the Resources section, directly satisfying the core requirement",
+            "Handles missing Resources section gracefully with .get('Resources', {}) defaulting to empty dict, returning an empty list instead of raising a KeyError",
+            "Concise and readable implementation with minimal complexity"
         ],
         "weaknesses": [
-            "No error handling for missing 'Resources' key, malformed JSON, or file I/O errors that would cause crashes",
-            "Python version doesn't validate that the template is actually a valid CloudFormation template or handle edge cases like empty Resources",
-            "No handling for YAML format CloudFormation templates, which are commonly used alongside JSON",
-            "Lacks input validation and doesn't check if the template parameter is None or invalid before processing"
+            "No error handling for invalid JSON input - json.loads will raise a JSONDecodeError if the template string is malformed, which should be caught and handled",
+            "No input validation to check if the input is a string or if the template follows basic CloudFormation structure (e.g., checking template format version)",
+            "No documentation or type hints to clarify expected input/output types, and no handling for edge cases like None input"
         ],
         "task": "Parse an AWS CloudFormation template in JSON format and extract all resource logical IDs"
     },
     {
-        "score": 7,
+        "score": 5.5,
         "strengths": [
-            "Clean, well-documented code with clear docstring explaining AWS S3 naming rules",
-            "Comprehensive test cases covering edge cases like consecutive hyphens, IP format, and length boundaries",
-            "Efficient regex-based validation that correctly handles most standard requirements"
+            "Uses regex for concise pattern matching",
+            "Correctly enforces start/end with alphanumeric character",
+            "Prevents hyphens at start and end of bucket name"
         ],
         "weaknesses": [
-            "Regex pattern allows consecutive hyphens (e.g., 'my--bucket' passes when it should fail based on AWS rules)",
-            "Missing validation for IP address format specifically (192.168.1.1 is correctly rejected but not explicitly handled)",
-            "Does not mention that bucket names must be globally unique across all AWS accounts, which is an important AWS-specific constraint"
+            "Regex pattern has a length flaw: `[a-z0-9-]{1,61}` requires at least 1 middle character, meaning minimum enforced length is 3 but names of exactly 2 characters (which should be invalid) are not possible, yet names of 3 chars work \u2014 however the middle group forces at least 1 char making 2-char names impossible to match, which is correct, but the upper bound {1,61} combined with the outer chars allows up to 63 total which is correct; the real issue is the redundant `len(name) <= 63` check since the regex already caps at 63",
+            "Does not handle IP address format rejection (e.g., '192.168.1.1' should be invalid per AWS rules) and does not reject names containing consecutive hyphens or dots (though dots aren't in the pattern, the solution is incomplete for full AWS compliance)",
+            "Missing validation for additional AWS rules: bucket names cannot be formatted as IP addresses, and the solution lacks a docstring or error messaging to explain why a name is invalid"
         ],
         "task": "Write a Python function to validate AWS S3 bucket names according to AWS naming rules"
     },
     {
-        "score": 7,
+        "score": 8.5,
         "strengths": [
-            "Correctly matches the basic ARN structure with arn:aws:iam:: prefix",
-            "Properly validates the 12-digit AWS account ID using (\\d{12})",
-            "Captures both account ID and role name in separate groups for easy extraction"
+            "Uses named capture groups (?P<account_id> and ?P<role_name>) to separately capture account ID and role name as required",
+            "Account ID pattern \\d{12} correctly enforces exactly 12 digits matching AWS account ID format",
+            "Role name character class [\\w+=,.@-]+ matches AWS IAM role naming conventions including allowed special characters"
         ],
         "weaknesses": [
-            "Role name pattern (.+) is too permissive and allows invalid characters; AWS role names must match [a-zA-Z0-9+=,.@_-]",
-            "Does not account for role paths (e.g., arn:aws:iam::123456789012:role/service/MyRole) which are valid in AWS",
-            "Missing anchors or validation that role name is not empty after the slash, and (.+) could match across path separators unintentionally"
+            "Does not handle AWS GovCloud or China regions (arn:aws-us-gov or arn:aws-cn partitions) which may be needed in some environments",
+            "Missing input validation and error handling in match_arn function - should handle None/empty input gracefully",
+            "No unit tests or example usage demonstrating the capture groups work correctly for both valid and invalid ARN examples"
         ],
         "task": "Create a regex pattern to match valid AWS IAM role ARNs"
     },
     {
-        "score": 5,
+        "score": 8.5,
         "strengths": [
-            "Clear function signature with proper type hints and docstring",
-            "Correct specifications for the instance types included",
-            "Proper error handling with descriptive ValueError message"
+            "Correctly implements recursive flattening with dot-notation keys for both dict and list types, matching the specified format like 'network.interfaces.0.mac'",
+            "Handles all three cases cleanly: dictionaries, lists (with integer indices), and scalar leaf values",
+            "Clean, readable implementation with proper prefix management avoiding leading dots"
         ],
         "weaknesses": [
-            "Hardcoded dictionary is not scalable and becomes unmaintainable as AWS adds new instance types regularly",
-            "Missing many common instance types (t3a, t4g, m6i, c6i, r5, r6, i3, p3, etc.) limiting practical utility",
-            "No support for case-insensitive input or instance type variants, and no mechanism to fetch real-time specs from AWS API or external source"
+            "No error handling for edge cases like None input, non-JSON-serializable types, or circular references that could cause RecursionError",
+            "Missing docstring and type hints which would improve code quality and usability for AWS metadata use cases",
+            "Does not handle the case where data is passed as a JSON string rather than already-parsed dict, which is common when working with raw EC2 metadata API responses"
         ],
-        "task": "Write a Python function to convert AWS EC2 instance types to their vCPU and memory specifications"
+        "task": "Write a Python function to convert AWS EC2 instance metadata JSON response into a flattened dictionary with dot-notation keys"
     },
     {
-        "score": 7,
+        "score": 7.5,
         "strengths": [
-            "Correctly identifies all required Lambda configuration fields (FunctionName, Runtime, Handler, Role)",
-            "Implements appropriate constraints for numeric fields (Timeout: 1-900s, MemorySize: 128-10240 MB) matching AWS Lambda limits",
-            "Uses draft-07 schema standard and prevents unexpected properties with additionalProperties: false"
+            "Correctly identifies the AKIA prefix which is specific to AWS long-term access key IDs",
+            "Uses [A-Z0-9]{16} character class which accurately matches the 16 uppercase alphanumeric characters following the prefix",
+            "Uses re.compile() for efficiency when the pattern is used multiple times"
         ],
         "weaknesses": [
-            "Runtime field lacks enum constraint for valid values (python3.11, nodejs18.x, etc.) - should restrict to AWS-supported runtimes",
-            "Environment and Tags objects lack property definitions - should specify that they contain string key-value pairs for proper validation",
-            "Missing optional but commonly-used fields like VpcConfig, Layers, EphemeralStorage, and Architectures that real Lambda configurations often include"
+            "No word boundary assertions (\\b) to prevent partial matches within longer strings (e.g., 'XAKIA...' could still be problematic without anchoring context)",
+            "Does not use a capture group (parentheses) around the full pattern, which was explicitly requested in the criteria to 'capture the full key'",
+            "Missing handling for other AWS key prefixes like ASIA (temporary/STS keys) or AROA, AIDA, AKIA variants that security scanning tools typically also flag"
         ],
-        "task": "Create a JSON schema that validates AWS Lambda function configuration objects"
+        "task": "Create a regex pattern to extract AWS access key IDs from logs or configuration files"
     },
     {
-        "score": 7,
+        "score": 8.5,
         "strengths": [
-            "Correctly identifies the AKIA prefix that all AWS access key IDs begin with",
-            "Uses appropriate character class [0-9A-Z] to match the alphanumeric format of access keys",
-            "Simple and efficient pattern that avoids false positives from random strings"
+            "Correctly converts milliseconds to seconds by dividing by 1000 before passing to fromtimestamp",
+            "Explicitly uses UTC timezone via timezone.utc, which is critical for CloudWatch timestamps that are always in UTC",
+            "Returns ISO 8601 format using the built-in isoformat() method, satisfying the output requirement with minimal code"
         ],
         "weaknesses": [
-            "Lacks word boundaries (\\b) which could match partial keys within longer strings",
-            "No anchors or context validation to ensure the pattern matches complete 20-character keys in realistic log formats",
-            "Doesn't account for potential variations in log formatting or escaped characters that might appear in actual log files"
-        ],
-        "task": "Write a regex pattern to extract AWS access key IDs from log files"
-    },
-    {
-        "score": 6,
-        "strengths": [
-            "Simple and straightforward implementation that correctly converts milliseconds to seconds and formats the output",
-            "Includes docstring with clear parameter and return documentation",
-            "Provides test cases demonstrating basic functionality"
-        ],
-        "weaknesses": [
-            "Uses deprecated datetime.utcfromtimestamp() which is unsafe for ambiguous times; should use datetime.fromtimestamp() with timezone.utc instead",
-            "No error handling for invalid inputs (negative timestamps, non-integer values, None)",
-            "Missing timezone awareness - should use timezone-aware datetime objects for production use with CloudWatch logs across regions"
+            "No input validation or error handling for invalid inputs such as negative values, non-integer types, or None",
+            "No docstring or type hints beyond the basic int annotation, reducing maintainability and discoverability",
+            "The isoformat() output includes microseconds (e.g., +00:00 suffix) which may not match the exact ISO 8601 variant expected; a strftime format string could provide more explicit control over the output format"
         ],
         "task": "Write a Python function to parse AWS CloudWatch log timestamps and convert them to a human-readable format"
     },
     {
-        "score": 6,
+        "score": 8.5,
         "strengths": [
-            "Correctly validates the basic RDS endpoint structure with proper domain hierarchy",
-            "Uses named capture groups for identifier and region, improving code readability and data extraction",
-            "Anchors the pattern with ^ and $ to prevent partial matches"
+            "Correctly defines all required fields (FunctionName, Runtime, Handler, Role) with appropriate data types and validation patterns, including ARN format validation for Role",
+            "Includes comprehensive enum list for Runtime covering current AWS-supported runtimes, and validates optional fields like Timeout (1-900s), MemorySize (128-10240MB with multipleOf:64), and Layers (max 5 with ARN pattern)",
+            "Well-structured schema with additionalProperties:false to prevent unknown fields, proper use of draft-07, and realistic constraints matching actual AWS Lambda limits"
         ],
         "weaknesses": [
-            "Region pattern is incomplete - uses \\d for single digit but AWS regions have 2+ digits (e.g., us-east-1, eu-west-2)",
-            "Identifier pattern doesn't account for uppercase letters which are valid in RDS endpoint names",
-            "Doesn't validate RDS cluster endpoints or other valid RDS endpoint variants (read replicas, proxy endpoints)"
+            "FunctionName pattern ^[a-zA-Z0-9-_]+$ is missing the colon character needed for qualified ARN names, and maxLength of 64 should be 140 to support full ARN format as AWS allows function names up to 64 chars but ARNs up to 140",
+            "VpcConfig is missing validation for minimum array lengths (SubnetIds and SecurityGroupIds should require at least one item when VpcConfig is provided), and there's no EphemeralStorage field which is a commonly used Lambda configuration option",
+            "Environment Variables object lacks constraints on key naming (AWS requires keys to start with a letter and contain only alphanumeric/underscore characters) and missing maximum count validation for environment variables"
         ],
-        "task": "Create a regex pattern to validate AWS RDS database endpoint URLs"
+        "task": "Create a JSON schema that validates the structure of an AWS Lambda function configuration object"
     },
     {
         "score": 6.5,
         "strengths": [
-            "Clear function signature with proper documentation and type hints in docstring",
-            "Correct pricing values for major S3 storage classes as of recent AWS pricing",
-            "Includes input validation with meaningful error message for unknown storage classes"
+            "Clean and concise implementation using list comprehension",
+            "Correctly uses .get() to safely handle missing attributes without raising KeyError",
+            "Directly satisfies the core requirement of filtering items by attribute name and value"
         ],
         "weaknesses": [
-            "No validation for negative or zero gb_stored values which could produce misleading results",
-            "Hardcoded to US East region pricing without flexibility for other regions which have different rates",
-            "Missing consideration of minimum storage duration charges (e.g., 30 days for STANDARD_IA, 90 days for GLACIER_IR) that significantly impact actual costs"
+            "Does not handle DynamoDB-typed attribute format (e.g., {'S': 'value'} or {'N': '123'}) which is the actual structure returned by DynamoDB boto3 calls",
+            "No input validation or error handling for edge cases like None items list or non-dict items",
+            "Missing type hints and docstring which would improve maintainability and clarity of expected inputs/outputs"
         ],
-        "task": "Write a Python function to calculate AWS S3 storage costs based on storage class and GB stored"
+        "task": "Write a Python function to filter AWS DynamoDB table items based on a simple attribute condition"
     },
     {
-        "score": 7,
+        "score": 6.5,
         "strengths": [
-            "Uses SecureString type for sensitive data encryption",
-            "Includes explicit KMS key ARN for encryption control",
-            "Implements tagging for resource organization and cost tracking"
+            "Correctly captures region codes as a named group using re.search with a non-consuming prefix pattern, satisfying the 'capture separately' requirement",
+            "Handles the most common AWS region directional formats (east, west, north, south, central, and compound directions) and validates the numeric suffix",
+            "Tested against a representative set of real AWS endpoint URLs covering multiple services and regions"
         ],
         "weaknesses": [
-            "Hardcoded password in configuration violates security best practices",
-            "Missing Description field for parameter documentation",
-            "Lacks Tier specification (Standard vs Advanced) and no AllowedPattern validation for password format"
+            "The two-letter country code prefix is hardcoded as exactly [a-z]{2}, which would fail for hypothetical future regions or non-standard prefixes, and more critically misses regions like 'ap-east-1' (ap = Asia Pacific, which is valid but the direction 'east' alone with 'ap' prefix works, however 'me-south-1' or 'af-south-1' would also work \u2014 the real gap is that the pattern doesn't account for AWS's 'gov' regions like 'us-gov-west-1' or 'us-gov-east-1' which use a three-segment format)",
+            "No handling of edge cases such as S3 path-style URLs, regional endpoints with additional subdomains, or endpoints that don't follow the standard service.region.amazonaws.com pattern",
+            "The solution lacks extraction robustness \u2014 it uses a fixed positional pattern rather than a more flexible approach (e.g., splitting on dots or using a broader region pattern), making it brittle against URL format variations like 'bucket.s3.us-east-1.amazonaws.com'"
         ],
-        "task": "Create a JSON configuration object for an AWS Systems Manager Parameter Store entry with encryption and tagging"
+        "task": "Create a regex pattern to match and extract AWS region codes from various AWS service endpoints"
+    },
+    {
+        "score": 7.5,
+        "strengths": [
+            "Correctly implements tiered pricing logic with proper tier boundary calculations for STANDARD class, accurately computing costs across multiple pricing tiers",
+            "Covers all major S3 storage classes including GLACIER_DEEP_ARCHIVE and INTELLIGENT_TIERING with reasonable pricing approximations",
+            "Includes input validation with a descriptive ValueError for unknown storage classes"
+        ],
+        "weaknesses": [
+            "INTELLIGENT_TIERING pricing is oversimplified - it has monitoring/automation fees per object and separate frequent/infrequent access tier rates that differ from STANDARD pricing",
+            "Missing minimum storage duration charges and minimum object size fees (e.g., STANDARD_IA has 128KB minimum billable size and 30-day minimum), which are critical for accurate cost calculation",
+            "No handling of edge cases like negative size_bytes input, and pricing values may be outdated - GLACIER_DEEP_ARCHIVE is currently $0.00099/GB but ONEZONE_IA should be $0.01/GB which appears correct, though these hardcoded values will become stale without documentation or update mechanism"
+        ],
+        "task": "Write a Python function to calculate AWS S3 storage costs based on object size and storage class"
     }
 ]

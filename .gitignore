@@ -9,3 +9,11 @@ wheels/
 # Virtual environments
 .venv
 .env
+
+# Local LangGraph checkpoints
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+
+refined_*.json
