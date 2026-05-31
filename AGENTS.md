@@ -17,6 +17,10 @@ uv sync
 
 Requires `ANTHROPIC_API_KEY` in a `.env` file.
 
+## Code style
+
+Use type hints for Python code, including function parameters, return values, class attributes, and non-obvious local variables. Use Google-style docstrings for Python code. Public functions, methods, classes, and non-trivial private helpers should document parameters with `Args:`, returned values with `Returns:`, and raised exceptions with `Raises:` when applicable.
+
 ## Architecture
 
 Single-file pipeline ([main.py](main.py)) implementing an iterative prompt evaluation loop for AWS coding tasks. The flow:
