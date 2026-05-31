@@ -43,6 +43,7 @@ python main.py --thread-id prompt-evaluation-dev --checkpoint-db langgraph_check
 | `--solution-token-multiplier` | `2.0` | Token multiplier for solution generation |
 | `--evaluation-token-multiplier` | `1.0` | Token multiplier for solution evaluation |
 | `--refinement-token-multiplier` | `2.0` | Token multiplier for criteria refinement |
+| `--max-token-corrections` | `3` | Maximum automatic max-token corrections; each correction increases only the failed stage multiplier by exactly `1.0` |
 
 ## How It Works
 
@@ -56,6 +57,8 @@ The agent runs a deterministic LangGraph policy graph across four model-backed s
 Each refinement iteration produces numbered output files (`refined_dataset_N.json`, `refined_solutions_N.json`, `refined_evaluation_results_N.json`). The best-scoring dataset across all iterations is saved to `best_dataset.json`.
 
 The graph stops when the mean score reaches the `--score` threshold, `--iterations` is exhausted, or `--stagnation` consecutive iterations show no improvement. LangGraph also stores orchestration state in the configured SQLite checkpoint database after graph steps, keyed by `--thread-id`.
+
+If a model call is truncated with `stop_reason='max_tokens'`, the graph applies a corrective action before stopping: it increases the failed stage's token multiplier by exactly `1.0` and retries that same stage, up to `--max-token-corrections`.
 
 ## Architecture
 

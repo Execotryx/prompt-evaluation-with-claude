@@ -28,8 +28,9 @@ import argparse
 import sqlite3
 import anthropic
 from abc import ABC, abstractmethod
+from collections.abc import Hashable
 from dotenv import load_dotenv
-from typing import Literal, Any, TypedDict
+from typing import Literal, Any, TypedDict, cast
 from json import dumps, loads
 from tqdm import tqdm
 from langgraph.graph import END, START, StateGraph
@@ -46,6 +47,7 @@ DATASET_TOKEN_MULTIPLIER: float = 2.0
 SOLUTION_TOKEN_MULTIPLIER: float = 2.0
 EVALUATION_TOKEN_MULTIPLIER: float = 1.0
 REFINEMENT_TOKEN_MULTIPLIER: float = 2.0
+MAX_TOKEN_CORRECTIONS: int = 3
 
 
 class ClaudeClient:
@@ -825,8 +827,11 @@ class AgentState(TypedDict, total=False):
     score_threshold: float
     max_iterations: int
     max_stagnation: int
+    token_correction_count: int
+    max_token_corrections: int
     current_stage: str
     failed_stage: str | None
+    retry_stage: str | None
     last_error: str | None
     stop_reason: str | None
     dataset_file: str
@@ -840,6 +845,58 @@ class AgentState(TypedDict, total=False):
     solution_token_multiplier: float
     evaluation_token_multiplier: float
     refinement_token_multiplier: float
+
+
+class AgentErrorState(TypedDict):
+    """Graph state update emitted when a node fails."""
+
+    current_stage: str
+    failed_stage: str
+    retry_stage: None
+    last_error: str
+    stop_reason: str
+
+
+class StageSuccessState(TypedDict, total=False):
+    """Graph state update emitted when a node completes successfully."""
+
+    current_stage: str
+    failed_stage: str | None
+    retry_stage: str | None
+    last_error: str | None
+    stop_reason: str | None
+    dataset: list[dict[str, str]]
+    solutions: list[dict[str, str]]
+    evaluation_results: list[dict[str, Any]]
+    best_dataset: list[dict[str, str]]
+    best_results: list[dict[str, Any]]
+    best_score: float
+    iteration: int
+    stagnation_count: int
+
+
+class TokenCorrectionState(TypedDict, total=False):
+    """Graph state update emitted after correcting a max-token error."""
+
+    current_stage: str
+    failed_stage: str | None
+    retry_stage: str
+    last_error: str | None
+    stop_reason: str | None
+    token_correction_count: int
+    dataset_token_multiplier: float
+    solution_token_multiplier: float
+    evaluation_token_multiplier: float
+    refinement_token_multiplier: float
+
+
+class FinalState(TypedDict):
+    """Graph state update emitted by the finalization node."""
+
+    current_stage: str
+    failed_stage: str | None
+    last_error: str | None
+    stop_reason: str
 
 
 def _state_value(state: AgentState, key: str, default: Any) -> Any:
@@ -959,6 +1016,29 @@ def _validate_evaluation_results(results: Any) -> list[dict[str, Any]]:
     return results
 
 
+def _stage_success(stage: str, updates: StageSuccessState | None = None) -> AgentState:
+    """Represent a successful node execution in graph state.
+
+    Args:
+        stage (str): Name of the node or stage that completed successfully.
+        updates (StageSuccessState | None): Additional partial state values
+            produced by the node.
+
+    Returns:
+        AgentState: Partial state update that records the successful stage and
+            clears stale error routing fields.
+    """
+    update: StageSuccessState = {
+        "current_stage": stage,
+        "failed_stage": None,
+        "retry_stage": None,
+        "last_error": None,
+    }
+    if updates is not None:
+        update.update(updates)
+    return cast(AgentState, update)
+
+
 def _node_error(stage: str, exc: Exception) -> AgentState:
     """Represent a recoverable node failure in graph state.
 
@@ -967,15 +1047,74 @@ def _node_error(stage: str, exc: Exception) -> AgentState:
         exc (Exception): Exception raised by the node.
 
     Returns:
-        AgentState: Partial state update that records the error and routes the
+        AgentErrorState: Partial state update that records the error and routes the
             graph toward finalization.
     """
-    return {
+    update: AgentErrorState = {
         "current_stage": stage,
         "failed_stage": stage,
+        "retry_stage": None,
         "last_error": f"{type(exc).__name__}: {exc}",
         "stop_reason": "error",
     }
+    return cast(AgentState, update)
+
+
+def _token_multiplier_key_for_stage(stage: str | None) -> str | None:
+    """Return the token multiplier state key controlled by a stage.
+
+    Args:
+        stage (str | None): Failed graph stage name.
+
+    Returns:
+        str | None: Matching token multiplier state key, or ``None`` when the
+            stage has no token multiplier to correct.
+    """
+    stage_to_key: dict[str, str] = {
+        "load_or_generate_dataset": "dataset_token_multiplier",
+        "load_or_generate_solutions": "solution_token_multiplier",
+        "load_or_evaluate_solutions": "evaluation_token_multiplier",
+        "refine_dataset": "refinement_token_multiplier",
+        "generate_refined_solutions": "solution_token_multiplier",
+        "evaluate_refined_solutions": "evaluation_token_multiplier",
+    }
+    if stage is None:
+        return None
+    return stage_to_key.get(stage)
+
+
+def _is_max_tokens_error(error: str | None) -> bool:
+    """Return whether an error string describes model output truncation.
+
+    Args:
+        error (str | None): Error string stored in graph state.
+
+    Returns:
+        bool: ``True`` when the error is a max-token truncation.
+    """
+    return bool(error and "stop_reason='max_tokens'" in error)
+
+
+def _can_correct_token_error(state: AgentState) -> bool:
+    """Return whether the graph should apply a token-multiplier correction.
+
+    Args:
+        state (AgentState): Current graph state containing error details and
+            correction counters.
+
+    Returns:
+        bool: ``True`` when the latest error is a max-token truncation, the
+            failed stage has a known multiplier, and the correction limit has
+            not been reached.
+    """
+    failed_stage: str | None = state.get("failed_stage")
+    correction_count: int = int(_state_value(state, "token_correction_count", 0))
+    max_corrections: int = int(_state_value(state, "max_token_corrections", MAX_TOKEN_CORRECTIONS))
+    return (
+        _is_max_tokens_error(state.get("last_error"))
+        and _token_multiplier_key_for_stage(failed_stage) is not None
+        and correction_count < max_corrections
+    )
 
 
 def load_or_generate_dataset(state: AgentState) -> AgentState:
@@ -997,11 +1136,32 @@ def load_or_generate_dataset(state: AgentState) -> AgentState:
             ClaudeClient(model=DATASET_MODEL),
             output_file=dataset_file,
         ).create_dataset(token_multiplier=token_multiplier)
-        return {
-            "dataset": _validate_dataset(dataset),
-            "current_stage": stage,
-            "last_error": None,
-        }
+        return _stage_success(stage, {"dataset": _validate_dataset(dataset)})
+    except Exception as exc:
+        return _node_error(stage, exc)
+
+
+def _generate_solutions_node(state: AgentState, stage: str, output_file: str) -> AgentState:
+    """Load or generate solutions for a dataset-backed graph node.
+
+    Args:
+        state (AgentState): Current graph state containing ``dataset`` and
+            optionally ``solution_token_multiplier``.
+        stage (str): Public graph node name to record in state.
+        output_file (str): Artifact path used by ``SolutionGenerator``.
+
+    Returns:
+        AgentState: Partial state with validated ``solutions`` on success, or
+            error details on failure.
+    """
+    try:
+        dataset: list[dict[str, str]] = _validate_dataset(state.get("dataset"))
+        token_multiplier: float = float(_state_value(state, "solution_token_multiplier", SOLUTION_TOKEN_MULTIPLIER))
+        solutions: list[dict[str, str]] = SolutionGenerator(
+            ClaudeClient(),
+            output_file=output_file,
+        ).generate_solutions(dataset, token_multiplier=token_multiplier)
+        return _stage_success(stage, {"solutions": _validate_solutions(solutions)})
     except Exception as exc:
         return _node_error(stage, exc)
 
@@ -1018,19 +1178,32 @@ def load_or_generate_solutions(state: AgentState) -> AgentState:
             ``last_error`` and ``stop_reason`` on failure.
     """
     stage = "load_or_generate_solutions"
+    solutions_file: str = _state_value(state, "solutions_file", SolutionGenerator.DEFAULT_SOLUTIONS_FILE)
+    return _generate_solutions_node(state, stage, solutions_file)
+
+
+def _evaluate_solutions_node(state: AgentState, stage: str, output_file: str) -> AgentState:
+    """Load or evaluate solutions for a dataset-backed graph node.
+
+    Args:
+        state (AgentState): Current graph state containing ``dataset``,
+            ``solutions``, and optionally ``evaluation_token_multiplier``.
+        stage (str): Public graph node name to record in state.
+        output_file (str): Artifact path used by ``PromptEvaluator``.
+
+    Returns:
+        AgentState: Partial state with validated ``evaluation_results`` on
+            success, or error details on failure.
+    """
     try:
         dataset: list[dict[str, str]] = _validate_dataset(state.get("dataset"))
-        solutions_file: str = _state_value(state, "solutions_file", SolutionGenerator.DEFAULT_SOLUTIONS_FILE)
-        token_multiplier: float = float(_state_value(state, "solution_token_multiplier", SOLUTION_TOKEN_MULTIPLIER))
-        solutions: list[dict[str, str]] = SolutionGenerator(
+        solutions: list[dict[str, str]] = _validate_solutions(state.get("solutions"))
+        token_multiplier: float = float(_state_value(state, "evaluation_token_multiplier", EVALUATION_TOKEN_MULTIPLIER))
+        results: list[dict[str, Any]] = PromptEvaluator(
             ClaudeClient(),
-            output_file=solutions_file,
-        ).generate_solutions(dataset, token_multiplier=token_multiplier)
-        return {
-            "solutions": _validate_solutions(solutions),
-            "current_stage": stage,
-            "last_error": None,
-        }
+            output_file=output_file,
+        ).evaluate_prompts(dataset, solutions, token_multiplier=token_multiplier)
+        return _stage_success(stage, {"evaluation_results": _validate_evaluation_results(results)})
     except Exception as exc:
         return _node_error(stage, exc)
 
@@ -1048,22 +1221,8 @@ def load_or_evaluate_solutions(state: AgentState) -> AgentState:
             success, or ``last_error`` and ``stop_reason`` on failure.
     """
     stage = "load_or_evaluate_solutions"
-    try:
-        dataset: list[dict[str, str]] = _validate_dataset(state.get("dataset"))
-        solutions: list[dict[str, str]] = _validate_solutions(state.get("solutions"))
-        evaluation_file: str = _state_value(state, "evaluation_file", PromptEvaluator.DEFAULT_EVALUATION_FILE)
-        token_multiplier: float = float(_state_value(state, "evaluation_token_multiplier", EVALUATION_TOKEN_MULTIPLIER))
-        results: list[dict[str, Any]] = PromptEvaluator(
-            ClaudeClient(),
-            output_file=evaluation_file,
-        ).evaluate_prompts(dataset, solutions, token_multiplier=token_multiplier)
-        return {
-            "evaluation_results": _validate_evaluation_results(results),
-            "current_stage": stage,
-            "last_error": None,
-        }
-    except Exception as exc:
-        return _node_error(stage, exc)
+    evaluation_file: str = _state_value(state, "evaluation_file", PromptEvaluator.DEFAULT_EVALUATION_FILE)
+    return _evaluate_solutions_node(state, stage, evaluation_file)
 
 
 def initialize_best(state: AgentState) -> AgentState:
@@ -1084,15 +1243,16 @@ def initialize_best(state: AgentState) -> AgentState:
         best_dataset_file: str = _state_value(state, "best_dataset_file", BEST_DATASET_FILE)
         best_score: float = _mean_score(results)
         _save_best_dataset(dataset, best_dataset_file)
-        return {
-            "best_dataset": dataset,
-            "best_results": results,
-            "best_score": best_score,
-            "iteration": int(_state_value(state, "iteration", 0)),
-            "stagnation_count": int(_state_value(state, "stagnation_count", 0)),
-            "current_stage": stage,
-            "last_error": None,
-        }
+        return _stage_success(
+            stage,
+            {
+                "best_dataset": dataset,
+                "best_results": results,
+                "best_score": best_score,
+                "iteration": int(_state_value(state, "iteration", 0)),
+                "stagnation_count": int(_state_value(state, "stagnation_count", 0)),
+            },
+        )
     except Exception as exc:
         return _node_error(stage, exc)
 
@@ -1125,11 +1285,7 @@ def decide_next_step(state: AgentState) -> AgentState:
         elif stagnation_count >= max_stagnation:
             stop_reason = "stagnation"
 
-        return {
-            "current_stage": stage,
-            "last_error": None,
-            "stop_reason": stop_reason,
-        }
+        return _stage_success(stage, {"stop_reason": stop_reason})
     except Exception as exc:
         return _node_error(stage, exc)
 
@@ -1156,11 +1312,7 @@ def refine_dataset(state: AgentState) -> AgentState:
             ClaudeClient(),
             output_file=output_file,
         ).refine_dataset(best_dataset, best_results, token_multiplier=token_multiplier)
-        return {
-            "dataset": _validate_dataset(dataset),
-            "current_stage": stage,
-            "last_error": None,
-        }
+        return _stage_success(stage, {"dataset": _validate_dataset(dataset)})
     except Exception as exc:
         return _node_error(stage, exc)
 
@@ -1178,21 +1330,8 @@ def generate_refined_solutions(state: AgentState) -> AgentState:
             success, or ``last_error`` and ``stop_reason`` on failure.
     """
     stage = "generate_refined_solutions"
-    try:
-        dataset: list[dict[str, str]] = _validate_dataset(state.get("dataset"))
-        output_file: str = _refined_artifact_path(state, "refined_solutions_pattern", "refined_solutions_{iteration}.json")
-        token_multiplier: float = float(_state_value(state, "solution_token_multiplier", SOLUTION_TOKEN_MULTIPLIER))
-        solutions: list[dict[str, str]] = SolutionGenerator(
-            ClaudeClient(),
-            output_file=output_file,
-        ).generate_solutions(dataset, token_multiplier=token_multiplier)
-        return {
-            "solutions": _validate_solutions(solutions),
-            "current_stage": stage,
-            "last_error": None,
-        }
-    except Exception as exc:
-        return _node_error(stage, exc)
+    output_file: str = _refined_artifact_path(state, "refined_solutions_pattern", "refined_solutions_{iteration}.json")
+    return _generate_solutions_node(state, stage, output_file)
 
 
 def evaluate_refined_solutions(state: AgentState) -> AgentState:
@@ -1208,22 +1347,8 @@ def evaluate_refined_solutions(state: AgentState) -> AgentState:
             on success, or ``last_error`` and ``stop_reason`` on failure.
     """
     stage = "evaluate_refined_solutions"
-    try:
-        dataset: list[dict[str, str]] = _validate_dataset(state.get("dataset"))
-        solutions: list[dict[str, str]] = _validate_solutions(state.get("solutions"))
-        output_file: str = _refined_artifact_path(state, "refined_evaluation_pattern", "refined_evaluation_results_{iteration}.json")
-        token_multiplier: float = float(_state_value(state, "evaluation_token_multiplier", EVALUATION_TOKEN_MULTIPLIER))
-        results: list[dict[str, Any]] = PromptEvaluator(
-            ClaudeClient(),
-            output_file=output_file,
-        ).evaluate_prompts(dataset, solutions, token_multiplier=token_multiplier)
-        return {
-            "evaluation_results": _validate_evaluation_results(results),
-            "current_stage": stage,
-            "last_error": None,
-        }
-    except Exception as exc:
-        return _node_error(stage, exc)
+    output_file: str = _refined_artifact_path(state, "refined_evaluation_pattern", "refined_evaluation_results_{iteration}.json")
+    return _evaluate_solutions_node(state, stage, output_file)
 
 
 def update_best_or_stagnation(state: AgentState) -> AgentState:
@@ -1246,10 +1371,8 @@ def update_best_or_stagnation(state: AgentState) -> AgentState:
         iteration = int(_state_value(state, "iteration", 0)) + 1
         stagnation_count = int(_state_value(state, "stagnation_count", 0))
 
-        updates: AgentState = {
+        updates: StageSuccessState = {
             "iteration": iteration,
-            "current_stage": stage,
-            "last_error": None,
         }
 
         if refined_score > best_score:
@@ -1266,9 +1389,49 @@ def update_best_or_stagnation(state: AgentState) -> AgentState:
         else:
             updates["stagnation_count"] = stagnation_count + 1
 
-        return updates
+        return _stage_success(stage, updates)
     except Exception as exc:
         return _node_error(stage, exc)
+
+
+def apply_token_multiplier_correction(state: AgentState) -> AgentState:
+    """Increase the failed stage's token multiplier by exactly one and retry.
+
+    Args:
+        state (AgentState): Current graph state containing ``failed_stage``,
+            ``last_error``, and token multiplier values.
+
+    Returns:
+        AgentState: Partial state with one token multiplier increased by
+            exactly ``1.0``, error fields cleared, and ``retry_stage`` set to
+            the failed stage, or an error state if the failed stage has no
+            configurable multiplier.
+    """
+    stage: str | None = state.get("failed_stage")
+    multiplier_key: str | None = _token_multiplier_key_for_stage(stage)
+    if stage is None or multiplier_key is None:
+        return _node_error("apply_token_multiplier_correction", ValueError("No token multiplier is mapped for the failed stage."))
+
+    current_multiplier: float = float(_state_value(state, multiplier_key, 1.0))
+    correction_count: int = int(_state_value(state, "token_correction_count", 0))
+    update: TokenCorrectionState = {
+        "current_stage": "apply_token_multiplier_correction",
+        "failed_stage": None,
+        "retry_stage": stage,
+        "last_error": None,
+        "stop_reason": None,
+        "token_correction_count": correction_count + 1,
+    }
+    corrected_multiplier: float = current_multiplier + 1.0
+    if multiplier_key == "dataset_token_multiplier":
+        update["dataset_token_multiplier"] = corrected_multiplier
+    elif multiplier_key == "solution_token_multiplier":
+        update["solution_token_multiplier"] = corrected_multiplier
+    elif multiplier_key == "evaluation_token_multiplier":
+        update["evaluation_token_multiplier"] = corrected_multiplier
+    else:
+        update["refinement_token_multiplier"] = corrected_multiplier
+    return cast(AgentState, update)
 
 
 def finalize(state: AgentState) -> AgentState:
@@ -1287,25 +1450,29 @@ def finalize(state: AgentState) -> AgentState:
     if not stop_reason:
         stop_reason = "complete"
     current_stage: str = _state_value(state, "current_stage", "finalize") if state.get("last_error") else "finalize"
-    return {
+    update: FinalState = {
         "current_stage": current_stage,
         "failed_stage": state.get("failed_stage"),
         "last_error": state.get("last_error"),
         "stop_reason": stop_reason,
     }
+    return cast(AgentState, update)
 
 
 def _route_after_stage(state: AgentState, next_node: str) -> str:
-    """Route to finalize after an error, otherwise continue to the next node.
+    """Route after a normal graph stage.
 
     Args:
         state (AgentState): Current graph state.
         next_node (str): Node name to route to when there is no error.
 
     Returns:
-        str: ``"finalize"`` when an error is present, otherwise ``next_node``.
+        str: Correction node for recoverable max-token errors, ``"finalize"``
+            for unrecoverable errors, otherwise ``next_node``.
     """
     if state.get("last_error") or state.get("stop_reason") == "error":
+        if _can_correct_token_error(state):
+            return "apply_token_multiplier_correction"
         return "finalize"
     return next_node
 
@@ -1323,6 +1490,25 @@ def _route_after_decision(state: AgentState) -> str:
     if state.get("last_error") or state.get("stop_reason"):
         return "finalize"
     return "refine_dataset"
+
+
+def _route_after_token_correction(state: AgentState) -> str:
+    """Route from token correction back to the failed stage.
+
+    Args:
+        state (AgentState): Current graph state after
+            ``apply_token_multiplier_correction``.
+
+    Returns:
+        str: Stage name to retry, or ``"finalize"`` if no retry stage exists.
+    """
+    retry_stage: str | None = state.get("retry_stage")
+    if state.get("last_error") or retry_stage is None:
+        return "finalize"
+    return retry_stage
+
+
+# Checkpoint history helpers.
 
 
 def _ensure_sqlite_metadata_serializer(checkpointer: SqliteSaver) -> None:
@@ -1366,6 +1552,177 @@ def _ensure_sqlite_metadata_serializer(checkpointer: SqliteSaver) -> None:
     serializer.loads = load_metadata  # type: ignore[attr-defined]
 
 
+def _decode_checkpoint_write(value_type: str, value: bytes) -> Any:
+    """Decode a LangGraph checkpoint write value.
+
+    Args:
+        value_type (str): Serializer type stored in the SQLite ``writes`` table.
+        value (bytes): Serialized channel value from the SQLite ``writes`` table.
+
+    Returns:
+        Any: Decoded checkpoint channel value.
+    """
+    checkpointer: SqliteSaver = SqliteSaver(sqlite3.connect(":memory:"))
+    _ensure_sqlite_metadata_serializer(checkpointer)
+    try:
+        return checkpointer.serde.loads_typed((value_type, value))
+    finally:
+        checkpointer.conn.close()
+
+
+def _latest_checkpoint_error(checkpoint_db: str, thread_id: str) -> str | None:
+    """Return the latest non-empty error detail from checkpoint write history.
+
+    Args:
+        checkpoint_db (str): SQLite checkpoint database path.
+        thread_id (str): LangGraph checkpoint thread ID.
+
+    Returns:
+        str | None: Latest stored ``last_error`` value, or ``None`` when no
+            non-empty error detail is present.
+    """
+    if not os.path.exists(checkpoint_db):
+        return None
+
+    conn: sqlite3.Connection = sqlite3.connect(checkpoint_db)
+    try:
+        rows: list[tuple[str, bytes]] = conn.execute(
+            """
+            SELECT type, value
+            FROM writes
+            WHERE thread_id = ?
+              AND channel = 'last_error'
+              AND length(value) > 0
+            ORDER BY rowid DESC
+            """,
+            (thread_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+    for value_type, value in rows:
+        decoded: Any = _decode_checkpoint_write(value_type, value)
+        if isinstance(decoded, str) and decoded:
+            return decoded
+    return None
+
+
+GRAPH_NODES: tuple[tuple[str, Any], ...] = (
+    ("load_or_generate_dataset", load_or_generate_dataset),
+    ("load_or_generate_solutions", load_or_generate_solutions),
+    ("load_or_evaluate_solutions", load_or_evaluate_solutions),
+    ("initialize_best", initialize_best),
+    ("decide_next_step", decide_next_step),
+    ("refine_dataset", refine_dataset),
+    ("generate_refined_solutions", generate_refined_solutions),
+    ("evaluate_refined_solutions", evaluate_refined_solutions),
+    ("update_best_or_stagnation", update_best_or_stagnation),
+    ("apply_token_multiplier_correction", apply_token_multiplier_correction),
+    ("finalize", finalize),
+)
+STAGE_EDGE_SPECS: tuple[tuple[str, str], ...] = (
+    ("load_or_generate_dataset", "load_or_generate_solutions"),
+    ("load_or_generate_solutions", "load_or_evaluate_solutions"),
+    ("load_or_evaluate_solutions", "initialize_best"),
+    ("initialize_best", "decide_next_step"),
+    ("refine_dataset", "generate_refined_solutions"),
+    ("generate_refined_solutions", "evaluate_refined_solutions"),
+    ("evaluate_refined_solutions", "update_best_or_stagnation"),
+    ("update_best_or_stagnation", "decide_next_step"),
+)
+STAGE_ROUTE_EXITS: dict[Hashable, str] = {
+    "apply_token_multiplier_correction": "apply_token_multiplier_correction",
+    "finalize": "finalize",
+}
+TOKEN_CORRECTION_ROUTES: dict[Hashable, str] = {
+    "load_or_generate_dataset": "load_or_generate_dataset",
+    "load_or_generate_solutions": "load_or_generate_solutions",
+    "load_or_evaluate_solutions": "load_or_evaluate_solutions",
+    "refine_dataset": "refine_dataset",
+    "generate_refined_solutions": "generate_refined_solutions",
+    "evaluate_refined_solutions": "evaluate_refined_solutions",
+    "finalize": "finalize",
+}
+
+
+# Graph construction helpers.
+
+
+def _add_graph_nodes(workflow: StateGraph) -> None:
+    """Register all LangGraph nodes used by the prompt-evaluation agent.
+
+    Args:
+        workflow (StateGraph): Mutable graph being assembled.
+
+    Returns:
+        None.
+    """
+    for node_name, node in GRAPH_NODES:
+        workflow.add_node(node_name, node)
+
+
+def _stage_route_map(next_node: str) -> dict[Hashable, str]:
+    """Return the route map for a normal stage transition.
+
+    Args:
+        next_node (str): Node reached when the current stage succeeds.
+
+    Returns:
+        dict[Hashable, str]: LangGraph route map including success, correction,
+            and finalization routes.
+    """
+    return {next_node: next_node, **STAGE_ROUTE_EXITS}
+
+
+def _add_stage_edges(workflow: StateGraph) -> None:
+    """Register deterministic and conditional routes for the graph.
+
+    Args:
+        workflow (StateGraph): Mutable graph being assembled.
+
+    Returns:
+        None.
+    """
+    workflow.add_edge(START, "load_or_generate_dataset")
+    for source_node, next_node in STAGE_EDGE_SPECS:
+        workflow.add_conditional_edges(
+            source_node,
+            lambda state, target=next_node: _route_after_stage(state, target),
+            _stage_route_map(next_node),
+        )
+    workflow.add_conditional_edges(
+        "decide_next_step",
+        _route_after_decision,
+        {"refine_dataset": "refine_dataset", "finalize": "finalize"},
+    )
+    workflow.add_conditional_edges(
+        "apply_token_multiplier_correction",
+        _route_after_token_correction,
+        TOKEN_CORRECTION_ROUTES,
+    )
+    workflow.add_edge("finalize", END)
+
+
+def _compile_graph(workflow: StateGraph, checkpoint_db: str) -> Any:
+    """Compile a graph with a SQLite checkpointer.
+
+    Args:
+        workflow (StateGraph): Graph to compile.
+        checkpoint_db (str): SQLite database path used by the LangGraph
+            checkpointer.
+
+    Returns:
+        Any: Compiled LangGraph application.
+    """
+    conn: sqlite3.Connection = sqlite3.connect(checkpoint_db, check_same_thread=False)
+    checkpointer: SqliteSaver = SqliteSaver(conn)
+    _ensure_sqlite_metadata_serializer(checkpointer)
+    checkpointer.setup()
+    return workflow.compile(checkpointer=checkpointer)
+
+
 def build_prompt_evaluation_agent(checkpoint_db: str = "langgraph_checkpoints.sqlite") -> Any:
     """Build and compile the LangGraph prompt-evaluation agent.
 
@@ -1378,71 +1735,9 @@ def build_prompt_evaluation_agent(checkpoint_db: str = "langgraph_checkpoints.sq
             input and a ``thread_id`` config.
     """
     workflow: StateGraph = StateGraph(AgentState)
-
-    workflow.add_node("load_or_generate_dataset", load_or_generate_dataset)
-    workflow.add_node("load_or_generate_solutions", load_or_generate_solutions)
-    workflow.add_node("load_or_evaluate_solutions", load_or_evaluate_solutions)
-    workflow.add_node("initialize_best", initialize_best)
-    workflow.add_node("decide_next_step", decide_next_step)
-    workflow.add_node("refine_dataset", refine_dataset)
-    workflow.add_node("generate_refined_solutions", generate_refined_solutions)
-    workflow.add_node("evaluate_refined_solutions", evaluate_refined_solutions)
-    workflow.add_node("update_best_or_stagnation", update_best_or_stagnation)
-    workflow.add_node("finalize", finalize)
-
-    workflow.add_edge(START, "load_or_generate_dataset")
-    workflow.add_conditional_edges(
-        "load_or_generate_dataset",
-        lambda state: _route_after_stage(state, "load_or_generate_solutions"),
-        {"load_or_generate_solutions": "load_or_generate_solutions", "finalize": "finalize"},
-    )
-    workflow.add_conditional_edges(
-        "load_or_generate_solutions",
-        lambda state: _route_after_stage(state, "load_or_evaluate_solutions"),
-        {"load_or_evaluate_solutions": "load_or_evaluate_solutions", "finalize": "finalize"},
-    )
-    workflow.add_conditional_edges(
-        "load_or_evaluate_solutions",
-        lambda state: _route_after_stage(state, "initialize_best"),
-        {"initialize_best": "initialize_best", "finalize": "finalize"},
-    )
-    workflow.add_conditional_edges(
-        "initialize_best",
-        lambda state: _route_after_stage(state, "decide_next_step"),
-        {"decide_next_step": "decide_next_step", "finalize": "finalize"},
-    )
-    workflow.add_conditional_edges(
-        "decide_next_step",
-        _route_after_decision,
-        {"refine_dataset": "refine_dataset", "finalize": "finalize"},
-    )
-    workflow.add_conditional_edges(
-        "refine_dataset",
-        lambda state: _route_after_stage(state, "generate_refined_solutions"),
-        {"generate_refined_solutions": "generate_refined_solutions", "finalize": "finalize"},
-    )
-    workflow.add_conditional_edges(
-        "generate_refined_solutions",
-        lambda state: _route_after_stage(state, "evaluate_refined_solutions"),
-        {"evaluate_refined_solutions": "evaluate_refined_solutions", "finalize": "finalize"},
-    )
-    workflow.add_conditional_edges(
-        "evaluate_refined_solutions",
-        lambda state: _route_after_stage(state, "update_best_or_stagnation"),
-        {"update_best_or_stagnation": "update_best_or_stagnation", "finalize": "finalize"},
-    )
-    workflow.add_conditional_edges(
-        "update_best_or_stagnation",
-        lambda state: _route_after_stage(state, "decide_next_step"),
-        {"decide_next_step": "decide_next_step", "finalize": "finalize"},
-    )
-    workflow.add_edge("finalize", END)
-
-    conn: sqlite3.Connection = sqlite3.connect(checkpoint_db, check_same_thread=False)
-    checkpointer: SqliteSaver = SqliteSaver(conn)
-    _ensure_sqlite_metadata_serializer(checkpointer)
-    checkpointer.setup()
-    return workflow.compile(checkpointer=checkpointer)
+    _add_graph_nodes(workflow)
+    _add_stage_edges(workflow)
+    return _compile_graph(workflow, checkpoint_db)
 
 
 def main(
@@ -1455,6 +1750,7 @@ def main(
     solution_token_multiplier: float = SOLUTION_TOKEN_MULTIPLIER,
     evaluation_token_multiplier: float = EVALUATION_TOKEN_MULTIPLIER,
     refinement_token_multiplier: float = REFINEMENT_TOKEN_MULTIPLIER,
+    max_token_corrections: int = MAX_TOKEN_CORRECTIONS,
 ) -> None:
     """Run the LangGraph prompt-evaluation agent with iterative refinement.
 
@@ -1480,6 +1776,9 @@ def main(
             for evaluation model calls.
         refinement_token_multiplier (float): Multiplier applied to ``MAX_TOKENS``
             for task-refinement model calls.
+        max_token_corrections (int): Maximum number of automatic corrections
+            for max-token truncation errors. Each correction increases only the
+            failed stage's multiplier by exactly ``1.0``.
 
     Returns:
         None.
@@ -1500,6 +1799,13 @@ def main(
         "score_threshold": score_threshold,
         "max_iterations": max_iterations,
         "max_stagnation": max_stagnation,
+        "token_correction_count": 0,
+        "max_token_corrections": max_token_corrections,
+        "current_stage": "start",
+        "failed_stage": None,
+        "retry_stage": None,
+        "last_error": None,
+        "stop_reason": None,
         "iteration": 0,
         "stagnation_count": 0,
         "dataset_file": EvaluationDatasetGenerator.DATASET_FILE,
@@ -1528,11 +1834,15 @@ def main(
     if stop_reason == "error":
         failed_stage: str = _state_value(final_state, "failed_stage", _state_value(final_state, "current_stage", "unknown"))
         current_stage: str = _state_value(final_state, "current_stage", "unknown")
+        checkpoint_error: str | None = _latest_checkpoint_error(checkpoint_db, thread_id)
+        if checkpoint_error:
+            print(f"Stopped with error in stage {failed_stage} (current stage: {current_stage}): {checkpoint_error}")
+            return
         print(
             f"Stopped with error in stage {failed_stage} (current stage: {current_stage}), "
             "but no error details were present in the final graph state."
         )
-        print("Try rerunning with a new --thread-id to capture a fresh error state.")
+        print("No non-empty last_error write was found in the checkpoint history.")
         return
 
     best_score = float(_state_value(final_state, "best_score", 0.0))
@@ -1541,6 +1851,89 @@ def main(
     print(f"Best mean score: {best_score:.2f}")
     print(f"Refinement passes completed: {iteration}")
     print(f"Best dataset: {_state_value(final_state, 'best_dataset_file', BEST_DATASET_FILE)}")
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser for the prompt-evaluation agent.
+
+    Returns:
+        argparse.ArgumentParser: Parser configured with all supported CLI flags.
+    """
+    parser: argparse.ArgumentParser = argparse.ArgumentParser(
+        description="Prompt evaluation pipeline with iterative refinement."
+    )
+    parser.add_argument(
+        "--score",
+        type=float,
+        default=SCORE_THRESHOLD,
+        metavar="N",
+        help=f"target mean score threshold, 1–10 (default: {SCORE_THRESHOLD})",
+    )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=MAX_REFINEMENT_ITERATIONS,
+        metavar="N",
+        help=f"maximum number of refinement passes (default: {MAX_REFINEMENT_ITERATIONS})",
+    )
+    parser.add_argument(
+        "--stagnation",
+        type=int,
+        default=MAX_STAGNATION_ITERATIONS,
+        metavar="N",
+        help=f"stop after N consecutive non-improving iterations (default: {MAX_STAGNATION_ITERATIONS})",
+    )
+    parser.add_argument(
+        "--thread-id",
+        type=str,
+        default="prompt-evaluation",
+        help="LangGraph checkpoint thread ID used for resumable runs",
+    )
+    parser.add_argument(
+        "--checkpoint-db",
+        type=str,
+        default="langgraph_checkpoints.sqlite",
+        help="SQLite database path used for LangGraph checkpoints",
+    )
+    parser.add_argument(
+        "--dataset-token-multiplier",
+        type=float,
+        default=DATASET_TOKEN_MULTIPLIER,
+        metavar="N",
+        help=f"token multiplier for dataset generation (default: {DATASET_TOKEN_MULTIPLIER})",
+    )
+    parser.add_argument(
+        "--solution-token-multiplier",
+        type=float,
+        default=SOLUTION_TOKEN_MULTIPLIER,
+        metavar="N",
+        help=f"token multiplier for solution generation (default: {SOLUTION_TOKEN_MULTIPLIER})",
+    )
+    parser.add_argument(
+        "--evaluation-token-multiplier",
+        type=float,
+        default=EVALUATION_TOKEN_MULTIPLIER,
+        metavar="N",
+        help=f"token multiplier for solution evaluation (default: {EVALUATION_TOKEN_MULTIPLIER})",
+    )
+    parser.add_argument(
+        "--refinement-token-multiplier",
+        type=float,
+        default=REFINEMENT_TOKEN_MULTIPLIER,
+        metavar="N",
+        help=f"token multiplier for criteria refinement (default: {REFINEMENT_TOKEN_MULTIPLIER})",
+    )
+    parser.add_argument(
+        "--max-token-corrections",
+        type=int,
+        default=MAX_TOKEN_CORRECTIONS,
+        metavar="N",
+        help=(
+            "maximum automatic max-token corrections; each correction "
+            f"increases the failed stage multiplier by exactly 1.0 (default: {MAX_TOKEN_CORRECTIONS})"
+        ),
+    )
+    return parser
 
 
 class PipelineArgs:
@@ -1552,71 +1945,7 @@ class PipelineArgs:
         Returns:
             None.
         """
-        parser: argparse.ArgumentParser = argparse.ArgumentParser(
-            description="Prompt evaluation pipeline with iterative refinement."
-        )
-        parser.add_argument(
-            "--score",
-            type=float,
-            default=SCORE_THRESHOLD,
-            metavar="N",
-            help=f"target mean score threshold, 1–10 (default: {SCORE_THRESHOLD})",
-        )
-        parser.add_argument(
-            "--iterations",
-            type=int,
-            default=MAX_REFINEMENT_ITERATIONS,
-            metavar="N",
-            help=f"maximum number of refinement passes (default: {MAX_REFINEMENT_ITERATIONS})",
-        )
-        parser.add_argument(
-            "--stagnation",
-            type=int,
-            default=MAX_STAGNATION_ITERATIONS,
-            metavar="N",
-            help=f"stop after N consecutive non-improving iterations (default: {MAX_STAGNATION_ITERATIONS})",
-        )
-        parser.add_argument(
-            "--thread-id",
-            type=str,
-            default="prompt-evaluation",
-            help="LangGraph checkpoint thread ID used for resumable runs",
-        )
-        parser.add_argument(
-            "--checkpoint-db",
-            type=str,
-            default="langgraph_checkpoints.sqlite",
-            help="SQLite database path used for LangGraph checkpoints",
-        )
-        parser.add_argument(
-            "--dataset-token-multiplier",
-            type=float,
-            default=DATASET_TOKEN_MULTIPLIER,
-            metavar="N",
-            help=f"token multiplier for dataset generation (default: {DATASET_TOKEN_MULTIPLIER})",
-        )
-        parser.add_argument(
-            "--solution-token-multiplier",
-            type=float,
-            default=SOLUTION_TOKEN_MULTIPLIER,
-            metavar="N",
-            help=f"token multiplier for solution generation (default: {SOLUTION_TOKEN_MULTIPLIER})",
-        )
-        parser.add_argument(
-            "--evaluation-token-multiplier",
-            type=float,
-            default=EVALUATION_TOKEN_MULTIPLIER,
-            metavar="N",
-            help=f"token multiplier for solution evaluation (default: {EVALUATION_TOKEN_MULTIPLIER})",
-        )
-        parser.add_argument(
-            "--refinement-token-multiplier",
-            type=float,
-            default=REFINEMENT_TOKEN_MULTIPLIER,
-            metavar="N",
-            help=f"token multiplier for criteria refinement (default: {REFINEMENT_TOKEN_MULTIPLIER})",
-        )
-        self.__args = parser.parse_args()
+        self.__args = _build_parser().parse_args()
 
     @property
     def score(self) -> float:
@@ -1699,6 +2028,15 @@ class PipelineArgs:
         """
         return self.__args.refinement_token_multiplier
 
+    @property
+    def max_token_corrections(self) -> int:
+        """Return the maximum automatic max-token corrections.
+
+        Returns:
+            int: Value supplied via ``--max-token-corrections``.
+        """
+        return self.__args.max_token_corrections
+
 
 if __name__ == "__main__":
     args = PipelineArgs()
@@ -1712,4 +2050,5 @@ if __name__ == "__main__":
         solution_token_multiplier=args.solution_token_multiplier,
         evaluation_token_multiplier=args.evaluation_token_multiplier,
         refinement_token_multiplier=args.refinement_token_multiplier,
+        max_token_corrections=args.max_token_corrections,
     )
