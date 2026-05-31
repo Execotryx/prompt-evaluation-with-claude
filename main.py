@@ -1427,8 +1427,9 @@ def main(
     config: dict[str, dict[str, str]] = {"configurable": {"thread_id": thread_id}}
     final_state: AgentState = graph.invoke(initial_state, config)
 
-    if final_state.get("last_error"):
-        print(f"Stopped with error at {final_state.get('current_stage')}: {final_state['last_error']}")
+    last_error: str | None = final_state.get("last_error")
+    if last_error:
+        print(f"Stopped with error at {final_state.get('current_stage')}: {last_error}")
         return
 
     best_score = float(_state_value(final_state, "best_score", 0.0))
