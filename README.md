@@ -25,6 +25,9 @@ python main.py
 # Customize thresholds
 python main.py --score 9.0 --iterations 5 --stagnation 2
 
+# Increase only the refinement token budget
+python main.py --refinement-token-multiplier 4.0
+
 # Use a custom LangGraph checkpoint thread / SQLite database
 python main.py --thread-id prompt-evaluation-dev --checkpoint-db langgraph_checkpoints.sqlite
 ```
@@ -36,6 +39,10 @@ python main.py --thread-id prompt-evaluation-dev --checkpoint-db langgraph_check
 | `--stagnation` | `3` | Stop after N consecutive non-improving iterations |
 | `--thread-id` | `prompt-evaluation` | LangGraph checkpoint thread ID used for resumable runs |
 | `--checkpoint-db` | `langgraph_checkpoints.sqlite` | SQLite database path used for LangGraph checkpoints |
+| `--dataset-token-multiplier` | `2.0` | Token multiplier for dataset generation |
+| `--solution-token-multiplier` | `2.0` | Token multiplier for solution generation |
+| `--evaluation-token-multiplier` | `1.0` | Token multiplier for solution evaluation |
+| `--refinement-token-multiplier` | `2.0` | Token multiplier for criteria refinement |
 
 ## How It Works
 

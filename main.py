@@ -42,6 +42,10 @@ SCORE_THRESHOLD: float = 9.5
 MAX_REFINEMENT_ITERATIONS: int = 10
 MAX_STAGNATION_ITERATIONS: int = 3
 BEST_DATASET_FILE: str = "best_dataset.json"
+DATASET_TOKEN_MULTIPLIER: float = 2.0
+SOLUTION_TOKEN_MULTIPLIER: float = 2.0
+EVALUATION_TOKEN_MULTIPLIER: float = 1.0
+REFINEMENT_TOKEN_MULTIPLIER: float = 2.0
 
 
 class ClaudeClient:
@@ -277,12 +281,16 @@ Example output:
             }
         }
 
-    def create_dataset(self) -> list[dict[str, Any]]:
+    def create_dataset(self, token_multiplier: float = DATASET_TOKEN_MULTIPLIER) -> list[dict[str, Any]]:
         """Generate or load the evaluation dataset.
 
         If ``evaluation_dataset.json`` does not exist, the model is called to
         produce the dataset which is then saved to that file. If the file
         already exists it is loaded directly without calling the model.
+
+        Args:
+            token_multiplier (float): Multiplier applied to ``MAX_TOKENS`` for
+                the dataset-generation model call.
 
         Returns:
             list[dict[str, Any]]: A list of dicts, each with ``"task"`` and
@@ -291,7 +299,7 @@ Example output:
         if not os.path.exists(self._output_file):
             response: str = self.client.ask(
                 question=self._build_prompt(),
-                token_multiplier=2.0,
+                token_multiplier=token_multiplier,
                 output_config=self._build_output_config(),
             )
             with open(self._output_file, "w") as f:
@@ -364,12 +372,19 @@ class SolutionGenerator(BaseAgent):
             }
         }
 
-    def _solve_task(self, task: str, solution_criteria: str) -> dict[str, str]:
+    def _solve_task(
+        self,
+        task: str,
+        solution_criteria: str,
+        token_multiplier: float = SOLUTION_TOKEN_MULTIPLIER,
+    ) -> dict[str, str]:
         """Ask the model to solve a single task.
 
         Args:
             task (str): The task description.
             solution_criteria (str): Criteria the solution must satisfy.
+            token_multiplier (float): Multiplier applied to ``MAX_TOKENS`` for
+                this solution-generation model call.
 
         Returns:
             dict[str, str]: A dict with ``"task"`` and ``"solution"`` keys.
@@ -377,12 +392,16 @@ class SolutionGenerator(BaseAgent):
         self.client.reset()
         response: str = self.client.ask(
             question=self._build_prompt(task=task, solution_criteria=solution_criteria),
-            token_multiplier=2.0,
+            token_multiplier=token_multiplier,
             output_config=self._build_output_config(),
         )
         return {"task": task, "solution": loads(response)["solution"]}
 
-    def generate_solutions(self, eval_dataset: list[dict[str, str]]) -> list[dict[str, str]]:
+    def generate_solutions(
+        self,
+        eval_dataset: list[dict[str, str]],
+        token_multiplier: float = SOLUTION_TOKEN_MULTIPLIER,
+    ) -> list[dict[str, str]]:
         """Generate solutions for every task in the evaluation dataset.
 
         If the output file already exists it is returned directly without
@@ -392,6 +411,8 @@ class SolutionGenerator(BaseAgent):
         Args:
             eval_dataset (list[dict[str, str]]): List of task dicts as produced by
                 ``EvaluationDatasetGenerator.create_dataset()``.
+            token_multiplier (float): Multiplier applied to ``MAX_TOKENS`` for
+                each solution-generation model call.
 
         Returns:
             list[dict[str, str]]: A list of dicts, each with ``"task"`` and ``"solution"`` keys.
@@ -401,7 +422,7 @@ class SolutionGenerator(BaseAgent):
                 return loads(f.read())
 
         solutions: list[dict[str, str]] = [
-            self._solve_task(item["task"], item["solution_criteria"])
+            self._solve_task(item["task"], item["solution_criteria"], token_multiplier)
             for item in tqdm(eval_dataset, desc="Generating solutions", unit="task")
         ]
 
@@ -501,7 +522,13 @@ Example response shape:
             }
         }
 
-    def _evaluate_task(self, task: str, solution: str, solution_criteria: str) -> dict[str, Any]:
+    def _evaluate_task(
+        self,
+        task: str,
+        solution: str,
+        solution_criteria: str,
+        token_multiplier: float = EVALUATION_TOKEN_MULTIPLIER,
+    ) -> dict[str, Any]:
         """Ask the model to evaluate a single solution and return structured feedback.
 
         Resets the client's conversation history before the call so that
@@ -515,6 +542,8 @@ Example response shape:
             task (str): The original task description.
             solution (str): The AI-generated solution to evaluate.
             solution_criteria (str): The criteria the solution should satisfy.
+            token_multiplier (float): Multiplier applied to ``MAX_TOKENS`` for
+                this evaluation model call.
 
         Returns:
             dict[str, Any]: A dict with ``"task"`` (str), ``"score"`` (float),
@@ -523,14 +552,19 @@ Example response shape:
         self.client.reset()
         response: str = self.client.ask(
             question=self._build_prompt(task=task, solution=solution, solution_criteria=solution_criteria),
-            token_multiplier=1.0,
+            token_multiplier=token_multiplier,
             output_config=self._build_output_config(),
         )
         result: dict[str, Any] = loads(response)
         result["task"] = task
         return result
 
-    def evaluate_prompts(self, eval_dataset: list[dict[str, str]], solutions: list[dict[str, str]]) -> list[dict[str, Any]]:
+    def evaluate_prompts(
+        self,
+        eval_dataset: list[dict[str, str]],
+        solutions: list[dict[str, str]],
+        token_multiplier: float = EVALUATION_TOKEN_MULTIPLIER,
+    ) -> list[dict[str, Any]]:
         """Evaluate every solution in the solutions list against its task criteria.
 
         If the output file already exists it is returned directly. Otherwise
@@ -543,6 +577,8 @@ Example response shape:
             solutions (list[dict[str, str]]): List of solution dicts with ``"task"`` and
                 ``"solution"`` keys, as produced by
                 ``SolutionGenerator.generate_solutions()``.
+            token_multiplier (float): Multiplier applied to ``MAX_TOKENS`` for
+                each evaluation model call.
 
         Returns:
             list[dict[str, Any]]: A list of evaluation dicts, each containing
@@ -556,7 +592,7 @@ Example response shape:
         solution_map: dict[str, str] = {s["task"]: s["solution"] for s in solutions}
 
         evaluation_results: list[dict[str, Any]] = [
-            self._evaluate_task(item["task"], solution_map[item["task"]], item["solution_criteria"])
+            self._evaluate_task(item["task"], solution_map[item["task"]], item["solution_criteria"], token_multiplier)
             for item in tqdm(eval_dataset, desc="Evaluating solutions", unit="task")
             if item["task"] in solution_map
         ]
@@ -658,7 +694,13 @@ Instructions:
             }
         }
 
-    def _refine_task(self, task: str, solution_criteria: str, weaknesses: list[str]) -> dict[str, str]:
+    def _refine_task(
+        self,
+        task: str,
+        solution_criteria: str,
+        weaknesses: list[str],
+        token_multiplier: float = REFINEMENT_TOKEN_MULTIPLIER,
+    ) -> dict[str, str]:
         """Ask the model to rewrite the solution criteria for a task.
 
         The task description is passed to the model for context only and is
@@ -669,6 +711,8 @@ Instructions:
             task (str): The original task description (carried through unchanged).
             solution_criteria (str): The original solution criteria to rewrite.
             weaknesses (list[str]): Weaknesses identified in the evaluated solution.
+            token_multiplier (float): Multiplier applied to ``MAX_TOKENS`` for
+                this refinement model call.
 
         Returns:
             dict[str, str]: A dict with the original ``"task"`` and a rewritten
@@ -677,7 +721,7 @@ Instructions:
         self.client.reset()
         response: str = self.client.ask(
             question=self._build_prompt(task=task, solution_criteria=solution_criteria, weaknesses=weaknesses),
-            token_multiplier=2.0,
+            token_multiplier=token_multiplier,
             output_config=self._build_output_config(),
         )
         return {"task": task, "solution_criteria": loads(response)["solution_criteria"]}
@@ -686,6 +730,7 @@ Instructions:
         self,
         eval_dataset: list[dict[str, str]],
         evaluation_results: list[dict[str, Any]],
+        token_multiplier: float = REFINEMENT_TOKEN_MULTIPLIER,
     ) -> list[dict[str, str]]:
         """Refine every task in the dataset using the corresponding evaluation weaknesses.
 
@@ -703,6 +748,8 @@ Instructions:
             evaluation_results (list[dict[str, Any]]): Results produced by
                 ``PromptEvaluator.evaluate_prompts()``, each containing
                 ``"task"`` (str) and ``"weaknesses"`` (list[str]) keys.
+            token_multiplier (float): Multiplier applied to ``MAX_TOKENS`` for
+                each refinement model call.
 
         Returns:
             list[dict[str, str]]: A list of refined task dicts, each with ``"task"``
@@ -719,7 +766,7 @@ Instructions:
         }
 
         refined: list[dict[str, str]] = [
-            self._refine_task(item["task"], item["solution_criteria"], weakness_map[item["task"]])
+            self._refine_task(item["task"], item["solution_criteria"], weakness_map[item["task"]], token_multiplier)
             if item["task"] in weakness_map
             else item
             for item in tqdm(eval_dataset, desc="Refining tasks", unit="task")
@@ -779,6 +826,7 @@ class AgentState(TypedDict, total=False):
     max_iterations: int
     max_stagnation: int
     current_stage: str
+    failed_stage: str | None
     last_error: str | None
     stop_reason: str | None
     dataset_file: str
@@ -788,6 +836,10 @@ class AgentState(TypedDict, total=False):
     refined_dataset_pattern: str
     refined_solutions_pattern: str
     refined_evaluation_pattern: str
+    dataset_token_multiplier: float
+    solution_token_multiplier: float
+    evaluation_token_multiplier: float
+    refinement_token_multiplier: float
 
 
 def _state_value(state: AgentState, key: str, default: Any) -> Any:
@@ -920,6 +972,7 @@ def _node_error(stage: str, exc: Exception) -> AgentState:
     """
     return {
         "current_stage": stage,
+        "failed_stage": stage,
         "last_error": f"{type(exc).__name__}: {exc}",
         "stop_reason": "error",
     }
@@ -930,7 +983,7 @@ def load_or_generate_dataset(state: AgentState) -> AgentState:
 
     Args:
         state (AgentState): Current graph state, optionally containing
-            ``dataset_file``.
+            ``dataset_file`` and ``dataset_token_multiplier``.
 
     Returns:
         AgentState: Partial state with validated ``dataset`` on success, or
@@ -939,10 +992,11 @@ def load_or_generate_dataset(state: AgentState) -> AgentState:
     stage = "load_or_generate_dataset"
     try:
         dataset_file: str = _state_value(state, "dataset_file", EvaluationDatasetGenerator.DATASET_FILE)
+        token_multiplier: float = float(_state_value(state, "dataset_token_multiplier", DATASET_TOKEN_MULTIPLIER))
         dataset: list[dict[str, Any]] = EvaluationDatasetGenerator(
             ClaudeClient(model=DATASET_MODEL),
             output_file=dataset_file,
-        ).create_dataset()
+        ).create_dataset(token_multiplier=token_multiplier)
         return {
             "dataset": _validate_dataset(dataset),
             "current_stage": stage,
@@ -957,7 +1011,7 @@ def load_or_generate_solutions(state: AgentState) -> AgentState:
 
     Args:
         state (AgentState): Current graph state containing ``dataset`` and
-            optionally ``solutions_file``.
+            optionally ``solutions_file`` and ``solution_token_multiplier``.
 
     Returns:
         AgentState: Partial state with validated ``solutions`` on success, or
@@ -967,10 +1021,11 @@ def load_or_generate_solutions(state: AgentState) -> AgentState:
     try:
         dataset: list[dict[str, str]] = _validate_dataset(state.get("dataset"))
         solutions_file: str = _state_value(state, "solutions_file", SolutionGenerator.DEFAULT_SOLUTIONS_FILE)
+        token_multiplier: float = float(_state_value(state, "solution_token_multiplier", SOLUTION_TOKEN_MULTIPLIER))
         solutions: list[dict[str, str]] = SolutionGenerator(
             ClaudeClient(),
             output_file=solutions_file,
-        ).generate_solutions(dataset)
+        ).generate_solutions(dataset, token_multiplier=token_multiplier)
         return {
             "solutions": _validate_solutions(solutions),
             "current_stage": stage,
@@ -985,7 +1040,8 @@ def load_or_evaluate_solutions(state: AgentState) -> AgentState:
 
     Args:
         state (AgentState): Current graph state containing ``dataset``,
-            ``solutions``, and optionally ``evaluation_file``.
+            ``solutions``, and optionally ``evaluation_file`` and
+            ``evaluation_token_multiplier``.
 
     Returns:
         AgentState: Partial state with validated ``evaluation_results`` on
@@ -996,10 +1052,11 @@ def load_or_evaluate_solutions(state: AgentState) -> AgentState:
         dataset: list[dict[str, str]] = _validate_dataset(state.get("dataset"))
         solutions: list[dict[str, str]] = _validate_solutions(state.get("solutions"))
         evaluation_file: str = _state_value(state, "evaluation_file", PromptEvaluator.DEFAULT_EVALUATION_FILE)
+        token_multiplier: float = float(_state_value(state, "evaluation_token_multiplier", EVALUATION_TOKEN_MULTIPLIER))
         results: list[dict[str, Any]] = PromptEvaluator(
             ClaudeClient(),
             output_file=evaluation_file,
-        ).evaluate_prompts(dataset, solutions)
+        ).evaluate_prompts(dataset, solutions, token_multiplier=token_multiplier)
         return {
             "evaluation_results": _validate_evaluation_results(results),
             "current_stage": stage,
@@ -1082,7 +1139,8 @@ def refine_dataset(state: AgentState) -> AgentState:
 
     Args:
         state (AgentState): Current graph state containing ``best_dataset``,
-            ``best_results``, iteration count, and refined artifact path pattern.
+            ``best_results``, iteration count, refined artifact path pattern, and
+            ``refinement_token_multiplier``.
 
     Returns:
         AgentState: Partial state with the newly refined ``dataset`` on success,
@@ -1093,10 +1151,11 @@ def refine_dataset(state: AgentState) -> AgentState:
         best_dataset: list[dict[str, str]] = _validate_dataset(state.get("best_dataset"))
         best_results: list[dict[str, Any]] = _validate_evaluation_results(state.get("best_results"))
         output_file: str = _refined_artifact_path(state, "refined_dataset_pattern", "refined_dataset_{iteration}.json")
+        token_multiplier: float = float(_state_value(state, "refinement_token_multiplier", REFINEMENT_TOKEN_MULTIPLIER))
         dataset: list[dict[str, str]] = TaskRefiner(
             ClaudeClient(),
             output_file=output_file,
-        ).refine_dataset(best_dataset, best_results)
+        ).refine_dataset(best_dataset, best_results, token_multiplier=token_multiplier)
         return {
             "dataset": _validate_dataset(dataset),
             "current_stage": stage,
@@ -1111,7 +1170,8 @@ def generate_refined_solutions(state: AgentState) -> AgentState:
 
     Args:
         state (AgentState): Current graph state containing the refined
-            ``dataset``, iteration count, and refined solution artifact pattern.
+            ``dataset``, iteration count, refined solution artifact pattern, and
+            ``solution_token_multiplier``.
 
     Returns:
         AgentState: Partial state with validated refined ``solutions`` on
@@ -1121,10 +1181,11 @@ def generate_refined_solutions(state: AgentState) -> AgentState:
     try:
         dataset: list[dict[str, str]] = _validate_dataset(state.get("dataset"))
         output_file: str = _refined_artifact_path(state, "refined_solutions_pattern", "refined_solutions_{iteration}.json")
+        token_multiplier: float = float(_state_value(state, "solution_token_multiplier", SOLUTION_TOKEN_MULTIPLIER))
         solutions: list[dict[str, str]] = SolutionGenerator(
             ClaudeClient(),
             output_file=output_file,
-        ).generate_solutions(dataset)
+        ).generate_solutions(dataset, token_multiplier=token_multiplier)
         return {
             "solutions": _validate_solutions(solutions),
             "current_stage": stage,
@@ -1139,7 +1200,8 @@ def evaluate_refined_solutions(state: AgentState) -> AgentState:
 
     Args:
         state (AgentState): Current graph state containing refined ``dataset``,
-            ``solutions``, iteration count, and refined evaluation artifact pattern.
+            ``solutions``, iteration count, refined evaluation artifact pattern,
+            and ``evaluation_token_multiplier``.
 
     Returns:
         AgentState: Partial state with validated refined ``evaluation_results``
@@ -1150,10 +1212,11 @@ def evaluate_refined_solutions(state: AgentState) -> AgentState:
         dataset: list[dict[str, str]] = _validate_dataset(state.get("dataset"))
         solutions: list[dict[str, str]] = _validate_solutions(state.get("solutions"))
         output_file: str = _refined_artifact_path(state, "refined_evaluation_pattern", "refined_evaluation_results_{iteration}.json")
+        token_multiplier: float = float(_state_value(state, "evaluation_token_multiplier", EVALUATION_TOKEN_MULTIPLIER))
         results: list[dict[str, Any]] = PromptEvaluator(
             ClaudeClient(),
             output_file=output_file,
-        ).evaluate_prompts(dataset, solutions)
+        ).evaluate_prompts(dataset, solutions, token_multiplier=token_multiplier)
         return {
             "evaluation_results": _validate_evaluation_results(results),
             "current_stage": stage,
@@ -1216,14 +1279,18 @@ def finalize(state: AgentState) -> AgentState:
             existing ``stop_reason``.
 
     Returns:
-        AgentState: Partial state with ``current_stage`` set to ``"finalize"``
-            and ``stop_reason`` populated.
+        AgentState: Partial state with ``stop_reason`` populated. Successful
+            runs set ``current_stage`` to ``"finalize"``; error runs preserve
+            the stage where the error occurred in ``failed_stage``.
     """
     stop_reason = state.get("stop_reason")
     if not stop_reason:
         stop_reason = "complete"
+    current_stage: str = _state_value(state, "current_stage", "finalize") if state.get("last_error") else "finalize"
     return {
-        "current_stage": "finalize",
+        "current_stage": current_stage,
+        "failed_stage": state.get("failed_stage"),
+        "last_error": state.get("last_error"),
         "stop_reason": stop_reason,
     }
 
@@ -1384,6 +1451,10 @@ def main(
     max_stagnation: int = MAX_STAGNATION_ITERATIONS,
     thread_id: str = "prompt-evaluation",
     checkpoint_db: str = "langgraph_checkpoints.sqlite",
+    dataset_token_multiplier: float = DATASET_TOKEN_MULTIPLIER,
+    solution_token_multiplier: float = SOLUTION_TOKEN_MULTIPLIER,
+    evaluation_token_multiplier: float = EVALUATION_TOKEN_MULTIPLIER,
+    refinement_token_multiplier: float = REFINEMENT_TOKEN_MULTIPLIER,
 ) -> None:
     """Run the LangGraph prompt-evaluation agent with iterative refinement.
 
@@ -1401,6 +1472,14 @@ def main(
             iterations. Defaults to the module-level ``MAX_STAGNATION_ITERATIONS``.
         thread_id (str): LangGraph checkpoint thread ID used for resumable runs.
         checkpoint_db (str): SQLite database path used for LangGraph checkpoints.
+        dataset_token_multiplier (float): Multiplier applied to ``MAX_TOKENS``
+            for dataset-generation model calls.
+        solution_token_multiplier (float): Multiplier applied to ``MAX_TOKENS``
+            for solution-generation model calls.
+        evaluation_token_multiplier (float): Multiplier applied to ``MAX_TOKENS``
+            for evaluation model calls.
+        refinement_token_multiplier (float): Multiplier applied to ``MAX_TOKENS``
+            for task-refinement model calls.
 
     Returns:
         None.
@@ -1408,6 +1487,13 @@ def main(
     print("=== LangGraph prompt-evaluation agent ===")
     print(f"Thread: {thread_id}")
     print(f"Checkpoint DB: {checkpoint_db}")
+    print(
+        "Token multipliers: "
+        f"dataset={dataset_token_multiplier}, "
+        f"solution={solution_token_multiplier}, "
+        f"evaluation={evaluation_token_multiplier}, "
+        f"refinement={refinement_token_multiplier}"
+    )
 
     graph: Any = build_prompt_evaluation_agent(checkpoint_db=checkpoint_db)
     initial_state: AgentState = {
@@ -1423,18 +1509,34 @@ def main(
         "refined_dataset_pattern": "refined_dataset_{iteration}.json",
         "refined_solutions_pattern": "refined_solutions_{iteration}.json",
         "refined_evaluation_pattern": "refined_evaluation_results_{iteration}.json",
+        "dataset_token_multiplier": dataset_token_multiplier,
+        "solution_token_multiplier": solution_token_multiplier,
+        "evaluation_token_multiplier": evaluation_token_multiplier,
+        "refinement_token_multiplier": refinement_token_multiplier,
     }
     config: dict[str, dict[str, str]] = {"configurable": {"thread_id": thread_id}}
     final_state: AgentState = graph.invoke(initial_state, config)
 
     last_error: str | None = final_state.get("last_error")
+    stop_reason: str = _state_value(final_state, "stop_reason", "complete")
     if last_error:
-        print(f"Stopped with error at {final_state.get('current_stage')}: {last_error}")
+        failed_stage: str = _state_value(final_state, "failed_stage", _state_value(final_state, "current_stage", "unknown"))
+        current_stage: str = _state_value(final_state, "current_stage", "unknown")
+        print(f"Stopped with error in stage {failed_stage} (current stage: {current_stage}): {last_error}")
+        return
+
+    if stop_reason == "error":
+        failed_stage: str = _state_value(final_state, "failed_stage", _state_value(final_state, "current_stage", "unknown"))
+        current_stage: str = _state_value(final_state, "current_stage", "unknown")
+        print(
+            f"Stopped with error in stage {failed_stage} (current stage: {current_stage}), "
+            "but no error details were present in the final graph state."
+        )
+        print("Try rerunning with a new --thread-id to capture a fresh error state.")
         return
 
     best_score = float(_state_value(final_state, "best_score", 0.0))
     iteration = int(_state_value(final_state, "iteration", 0))
-    stop_reason = _state_value(final_state, "stop_reason", "complete")
     print(f"Stopped: {stop_reason}")
     print(f"Best mean score: {best_score:.2f}")
     print(f"Refinement passes completed: {iteration}")
@@ -1486,6 +1588,34 @@ class PipelineArgs:
             default="langgraph_checkpoints.sqlite",
             help="SQLite database path used for LangGraph checkpoints",
         )
+        parser.add_argument(
+            "--dataset-token-multiplier",
+            type=float,
+            default=DATASET_TOKEN_MULTIPLIER,
+            metavar="N",
+            help=f"token multiplier for dataset generation (default: {DATASET_TOKEN_MULTIPLIER})",
+        )
+        parser.add_argument(
+            "--solution-token-multiplier",
+            type=float,
+            default=SOLUTION_TOKEN_MULTIPLIER,
+            metavar="N",
+            help=f"token multiplier for solution generation (default: {SOLUTION_TOKEN_MULTIPLIER})",
+        )
+        parser.add_argument(
+            "--evaluation-token-multiplier",
+            type=float,
+            default=EVALUATION_TOKEN_MULTIPLIER,
+            metavar="N",
+            help=f"token multiplier for solution evaluation (default: {EVALUATION_TOKEN_MULTIPLIER})",
+        )
+        parser.add_argument(
+            "--refinement-token-multiplier",
+            type=float,
+            default=REFINEMENT_TOKEN_MULTIPLIER,
+            metavar="N",
+            help=f"token multiplier for criteria refinement (default: {REFINEMENT_TOKEN_MULTIPLIER})",
+        )
         self.__args = parser.parse_args()
 
     @property
@@ -1533,6 +1663,42 @@ class PipelineArgs:
         """
         return self.__args.checkpoint_db
 
+    @property
+    def dataset_token_multiplier(self) -> float:
+        """Return the dataset-generation token multiplier.
+
+        Returns:
+            float: Value supplied via ``--dataset-token-multiplier``.
+        """
+        return self.__args.dataset_token_multiplier
+
+    @property
+    def solution_token_multiplier(self) -> float:
+        """Return the solution-generation token multiplier.
+
+        Returns:
+            float: Value supplied via ``--solution-token-multiplier``.
+        """
+        return self.__args.solution_token_multiplier
+
+    @property
+    def evaluation_token_multiplier(self) -> float:
+        """Return the evaluation token multiplier.
+
+        Returns:
+            float: Value supplied via ``--evaluation-token-multiplier``.
+        """
+        return self.__args.evaluation_token_multiplier
+
+    @property
+    def refinement_token_multiplier(self) -> float:
+        """Return the criteria-refinement token multiplier.
+
+        Returns:
+            float: Value supplied via ``--refinement-token-multiplier``.
+        """
+        return self.__args.refinement_token_multiplier
+
 
 if __name__ == "__main__":
     args = PipelineArgs()
@@ -1542,4 +1708,8 @@ if __name__ == "__main__":
         max_stagnation=args.stagnation,
         thread_id=args.thread_id,
         checkpoint_db=args.checkpoint_db,
+        dataset_token_multiplier=args.dataset_token_multiplier,
+        solution_token_multiplier=args.solution_token_multiplier,
+        evaluation_token_multiplier=args.evaluation_token_multiplier,
+        refinement_token_multiplier=args.refinement_token_multiplier,
     )

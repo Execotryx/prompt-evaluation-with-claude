@@ -138,9 +138,10 @@ class LangGraphAgentTests(unittest.TestCase):
             def __init__(self, *args, **kwargs):
                 pass
 
-            def refine_dataset(self, eval_dataset, evaluation_results):
+            def refine_dataset(self, eval_dataset, evaluation_results, token_multiplier=main.REFINEMENT_TOKEN_MULTIPLIER):
                 captured["dataset"] = eval_dataset
                 captured["results"] = evaluation_results
+                captured["token_multiplier"] = token_multiplier
                 return eval_dataset
 
         state: main.AgentState = {
@@ -149,6 +150,7 @@ class LangGraphAgentTests(unittest.TestCase):
             "best_results": results(7.0),
             "iteration": 0,
             "refined_dataset_pattern": str(self.root / "refined_dataset_{iteration}.json"),
+            "refinement_token_multiplier": 4.0,
         }
 
         with patch.object(main, "TaskRefiner", FakeTaskRefiner), patch.object(main, "ClaudeClient", DummyClaudeClient):
@@ -156,7 +158,17 @@ class LangGraphAgentTests(unittest.TestCase):
 
         self.assertIsNone(update["last_error"])
         self.assertEqual(captured["dataset"], best_dataset)
+        self.assertEqual(captured["token_multiplier"], 4.0)
         self.assertEqual(update["dataset"], best_dataset)
+
+    def test_node_error_records_failed_stage(self):
+        update: main.AgentState = main._node_error("refine_dataset", RuntimeError("boom"))
+        finalized: main.AgentState = main.finalize(update)
+
+        self.assertEqual(finalized["current_stage"], "refine_dataset")
+        self.assertEqual(finalized["failed_stage"], "refine_dataset")
+        self.assertEqual(finalized["last_error"], "RuntimeError: boom")
+        self.assertEqual(finalized["stop_reason"], "error")
 
     def test_sqlite_checkpoint_persists_final_state(self):
         checkpoint_db = str(self.root / "checkpoints.sqlite")
