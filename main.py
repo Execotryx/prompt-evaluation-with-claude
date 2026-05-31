@@ -25,12 +25,15 @@ BEST_DATASET_FILE : str
 import os
 import math
 import argparse
+import sqlite3
 import anthropic
 from abc import ABC, abstractmethod
 from dotenv import load_dotenv
-from typing import Literal, Any
+from typing import Literal, Any, TypedDict
 from json import dumps, loads
 from tqdm import tqdm
+from langgraph.graph import END, START, StateGraph
+from langgraph.checkpoint.sqlite import SqliteSaver
 
 MODEL: str = "claude-sonnet-4-6"
 DATASET_MODEL: str = "claude-haiku-4-5"
@@ -221,6 +224,17 @@ class EvaluationDatasetGenerator(BaseAgent):
 
     DATASET_FILE: str = "evaluation_dataset.json"
 
+    def __init__(self, client: ClaudeClient, output_file: str | None = None):
+        """Initialise the generator with a model client and optional output path.
+
+        Args:
+            client (ClaudeClient): A ``ClaudeClient`` instance used to query the model.
+            output_file (str | None): Path to write/read the dataset. Defaults to
+                ``evaluation_dataset.json``.
+        """
+        super().__init__(client)
+        self._output_file: str = output_file or self.DATASET_FILE
+
     def _build_prompt(self) -> str:  # type: ignore[override]
         """Return the prompt that asks the model to generate the task dataset."""
         return """
@@ -274,16 +288,16 @@ Example output:
             list[dict[str, Any]]: A list of dicts, each with ``"task"`` and
             ``"solution_criteria"`` keys.
         """
-        if not os.path.exists(self.DATASET_FILE):
+        if not os.path.exists(self._output_file):
             response: str = self.client.ask(
                 question=self._build_prompt(),
                 token_multiplier=2.0,
                 output_config=self._build_output_config(),
             )
-            with open(self.DATASET_FILE, "w") as f:
+            with open(self._output_file, "w") as f:
                 f.write(dumps(loads(response), indent=4))
         else:
-            with open(self.DATASET_FILE, "r") as f:
+            with open(self._output_file, "r") as f:
                 response = f.read()
 
         return loads(response)
@@ -727,43 +741,449 @@ def _mean_score(evaluation_results: list[dict[str, Any]]) -> float:
     Returns:
         float: Mean score across all results.
     """
+    if not evaluation_results:
+        raise ValueError("Cannot calculate a mean score from an empty evaluation result set.")
     return sum(r["score"] for r in evaluation_results) / len(evaluation_results)
 
 
-def _save_best_dataset(dataset: list[dict[str, str]]) -> None:
+def _save_best_dataset(dataset: list[dict[str, str]], output_file: str = BEST_DATASET_FILE) -> None:
     """Overwrite ``best_dataset.json`` with the current best dataset.
 
     Args:
         dataset (list[dict[str, str]]): The dataset to persist, where each dict
             contains ``"task"`` (str) and ``"solution_criteria"`` (str) keys.
     """
-    with open(BEST_DATASET_FILE, "w") as f:
+    with open(output_file, "w") as f:
         f.write(dumps(dataset, indent=4))
+
+
+class AgentState(TypedDict, total=False):
+    """Shared LangGraph state for the prompt-evaluation agent."""
+
+    dataset: list[dict[str, str]]
+    solutions: list[dict[str, str]]
+    evaluation_results: list[dict[str, Any]]
+    best_dataset: list[dict[str, str]]
+    best_results: list[dict[str, Any]]
+    best_score: float
+    iteration: int
+    stagnation_count: int
+    score_threshold: float
+    max_iterations: int
+    max_stagnation: int
+    current_stage: str
+    last_error: str | None
+    stop_reason: str | None
+    dataset_file: str
+    solutions_file: str
+    evaluation_file: str
+    best_dataset_file: str
+    refined_dataset_pattern: str
+    refined_solutions_pattern: str
+    refined_evaluation_pattern: str
+
+
+def _state_value(state: AgentState, key: str, default: Any) -> Any:
+    """Return a state value, falling back only when the key is absent or None."""
+    value = state.get(key)
+    return default if value is None else value
+
+
+def _refined_artifact_path(state: AgentState, key: str, default_pattern: str) -> str:
+    """Return the artifact path for the next refinement iteration."""
+    next_iteration = int(_state_value(state, "iteration", 0)) + 1
+    pattern: str = _state_value(state, key, default_pattern)
+    return pattern.format(iteration=next_iteration)
+
+
+def _validate_dataset(dataset: Any) -> list[dict[str, str]]:
+    """Validate a task dataset before accepting it into graph state."""
+    if not isinstance(dataset, list) or not dataset:
+        raise ValueError("Dataset must be a non-empty list.")
+
+    for index, item in enumerate(dataset):
+        if not isinstance(item, dict):
+            raise ValueError(f"Dataset item {index} must be an object.")
+        if not isinstance(item.get("task"), str) or not item["task"]:
+            raise ValueError(f"Dataset item {index} must include a non-empty task string.")
+        if not isinstance(item.get("solution_criteria"), str) or not item["solution_criteria"]:
+            raise ValueError(f"Dataset item {index} must include a non-empty solution_criteria string.")
+
+    return dataset
+
+
+def _validate_solutions(solutions: Any) -> list[dict[str, str]]:
+    """Validate generated solutions before accepting them into graph state."""
+    if not isinstance(solutions, list) or not solutions:
+        raise ValueError("Solutions must be a non-empty list.")
+
+    for index, item in enumerate(solutions):
+        if not isinstance(item, dict):
+            raise ValueError(f"Solution item {index} must be an object.")
+        if not isinstance(item.get("task"), str) or not item["task"]:
+            raise ValueError(f"Solution item {index} must include a non-empty task string.")
+        if not isinstance(item.get("solution"), str) or not item["solution"]:
+            raise ValueError(f"Solution item {index} must include a non-empty solution string.")
+
+    return solutions
+
+
+def _validate_evaluation_results(results: Any) -> list[dict[str, Any]]:
+    """Validate evaluation results before accepting them into graph state."""
+    if not isinstance(results, list) or not results:
+        raise ValueError("Evaluation results must be a non-empty list.")
+
+    for index, item in enumerate(results):
+        if not isinstance(item, dict):
+            raise ValueError(f"Evaluation result {index} must be an object.")
+        if not isinstance(item.get("task"), str) or not item["task"]:
+            raise ValueError(f"Evaluation result {index} must include a non-empty task string.")
+        if isinstance(item.get("score"), bool) or not isinstance(item.get("score"), (int, float)):
+            raise ValueError(f"Evaluation result {index} must include a numeric score.")
+        if not isinstance(item.get("strengths"), list):
+            raise ValueError(f"Evaluation result {index} must include a strengths list.")
+        if not isinstance(item.get("weaknesses"), list):
+            raise ValueError(f"Evaluation result {index} must include a weaknesses list.")
+
+    return results
+
+
+def _node_error(stage: str, exc: Exception) -> AgentState:
+    """Represent a recoverable node failure in graph state."""
+    return {
+        "current_stage": stage,
+        "last_error": f"{type(exc).__name__}: {exc}",
+        "stop_reason": "error",
+    }
+
+
+def load_or_generate_dataset(state: AgentState) -> AgentState:
+    """Load or generate the initial evaluation dataset."""
+    stage = "load_or_generate_dataset"
+    try:
+        dataset_file: str = _state_value(state, "dataset_file", EvaluationDatasetGenerator.DATASET_FILE)
+        dataset = EvaluationDatasetGenerator(
+            ClaudeClient(model=DATASET_MODEL),
+            output_file=dataset_file,
+        ).create_dataset()
+        return {
+            "dataset": _validate_dataset(dataset),
+            "current_stage": stage,
+            "last_error": None,
+        }
+    except Exception as exc:
+        return _node_error(stage, exc)
+
+
+def load_or_generate_solutions(state: AgentState) -> AgentState:
+    """Load or generate solutions for the current dataset."""
+    stage = "load_or_generate_solutions"
+    try:
+        dataset = _validate_dataset(state.get("dataset"))
+        solutions_file: str = _state_value(state, "solutions_file", SolutionGenerator.DEFAULT_SOLUTIONS_FILE)
+        solutions = SolutionGenerator(
+            ClaudeClient(),
+            output_file=solutions_file,
+        ).generate_solutions(dataset)
+        return {
+            "solutions": _validate_solutions(solutions),
+            "current_stage": stage,
+            "last_error": None,
+        }
+    except Exception as exc:
+        return _node_error(stage, exc)
+
+
+def load_or_evaluate_solutions(state: AgentState) -> AgentState:
+    """Load or evaluate solutions for the current dataset."""
+    stage = "load_or_evaluate_solutions"
+    try:
+        dataset = _validate_dataset(state.get("dataset"))
+        solutions = _validate_solutions(state.get("solutions"))
+        evaluation_file: str = _state_value(state, "evaluation_file", PromptEvaluator.DEFAULT_EVALUATION_FILE)
+        results = PromptEvaluator(
+            ClaudeClient(),
+            output_file=evaluation_file,
+        ).evaluate_prompts(dataset, solutions)
+        return {
+            "evaluation_results": _validate_evaluation_results(results),
+            "current_stage": stage,
+            "last_error": None,
+        }
+    except Exception as exc:
+        return _node_error(stage, exc)
+
+
+def initialize_best(state: AgentState) -> AgentState:
+    """Initialise best-scoring state from the first evaluation pass."""
+    stage = "initialize_best"
+    try:
+        dataset = _validate_dataset(state.get("dataset"))
+        results = _validate_evaluation_results(state.get("evaluation_results"))
+        best_dataset_file: str = _state_value(state, "best_dataset_file", BEST_DATASET_FILE)
+        best_score = _mean_score(results)
+        _save_best_dataset(dataset, best_dataset_file)
+        return {
+            "best_dataset": dataset,
+            "best_results": results,
+            "best_score": best_score,
+            "iteration": int(_state_value(state, "iteration", 0)),
+            "stagnation_count": int(_state_value(state, "stagnation_count", 0)),
+            "current_stage": stage,
+            "last_error": None,
+        }
+    except Exception as exc:
+        return _node_error(stage, exc)
+
+
+def decide_next_step(state: AgentState) -> AgentState:
+    """Decide whether the graph should stop or run another refinement pass."""
+    stage = "decide_next_step"
+    try:
+        best_score = float(_state_value(state, "best_score", 0.0))
+        score_threshold = float(_state_value(state, "score_threshold", SCORE_THRESHOLD))
+        iteration = int(_state_value(state, "iteration", 0))
+        max_iterations = int(_state_value(state, "max_iterations", MAX_REFINEMENT_ITERATIONS))
+        stagnation_count = int(_state_value(state, "stagnation_count", 0))
+        max_stagnation = int(_state_value(state, "max_stagnation", MAX_STAGNATION_ITERATIONS))
+
+        stop_reason: str | None = None
+        if best_score >= score_threshold:
+            stop_reason = "score_threshold"
+        elif iteration >= max_iterations:
+            stop_reason = "max_iterations"
+        elif stagnation_count >= max_stagnation:
+            stop_reason = "stagnation"
+
+        return {
+            "current_stage": stage,
+            "last_error": None,
+            "stop_reason": stop_reason,
+        }
+    except Exception as exc:
+        return _node_error(stage, exc)
+
+
+def refine_dataset(state: AgentState) -> AgentState:
+    """Refine solution criteria from the best-scoring dataset so far."""
+    stage = "refine_dataset"
+    try:
+        best_dataset = _validate_dataset(state.get("best_dataset"))
+        best_results = _validate_evaluation_results(state.get("best_results"))
+        output_file = _refined_artifact_path(state, "refined_dataset_pattern", "refined_dataset_{iteration}.json")
+        dataset = TaskRefiner(
+            ClaudeClient(),
+            output_file=output_file,
+        ).refine_dataset(best_dataset, best_results)
+        return {
+            "dataset": _validate_dataset(dataset),
+            "current_stage": stage,
+            "last_error": None,
+        }
+    except Exception as exc:
+        return _node_error(stage, exc)
+
+
+def generate_refined_solutions(state: AgentState) -> AgentState:
+    """Load or generate solutions for the refined dataset."""
+    stage = "generate_refined_solutions"
+    try:
+        dataset = _validate_dataset(state.get("dataset"))
+        output_file = _refined_artifact_path(state, "refined_solutions_pattern", "refined_solutions_{iteration}.json")
+        solutions = SolutionGenerator(
+            ClaudeClient(),
+            output_file=output_file,
+        ).generate_solutions(dataset)
+        return {
+            "solutions": _validate_solutions(solutions),
+            "current_stage": stage,
+            "last_error": None,
+        }
+    except Exception as exc:
+        return _node_error(stage, exc)
+
+
+def evaluate_refined_solutions(state: AgentState) -> AgentState:
+    """Load or evaluate solutions for the refined dataset."""
+    stage = "evaluate_refined_solutions"
+    try:
+        dataset = _validate_dataset(state.get("dataset"))
+        solutions = _validate_solutions(state.get("solutions"))
+        output_file = _refined_artifact_path(state, "refined_evaluation_pattern", "refined_evaluation_results_{iteration}.json")
+        results = PromptEvaluator(
+            ClaudeClient(),
+            output_file=output_file,
+        ).evaluate_prompts(dataset, solutions)
+        return {
+            "evaluation_results": _validate_evaluation_results(results),
+            "current_stage": stage,
+            "last_error": None,
+        }
+    except Exception as exc:
+        return _node_error(stage, exc)
+
+
+def update_best_or_stagnation(state: AgentState) -> AgentState:
+    """Update best dataset tracking after a refinement evaluation."""
+    stage = "update_best_or_stagnation"
+    try:
+        dataset = _validate_dataset(state.get("dataset"))
+        results = _validate_evaluation_results(state.get("evaluation_results"))
+        refined_score = _mean_score(results)
+        best_score = float(_state_value(state, "best_score", 0.0))
+        iteration = int(_state_value(state, "iteration", 0)) + 1
+        stagnation_count = int(_state_value(state, "stagnation_count", 0))
+
+        updates: AgentState = {
+            "iteration": iteration,
+            "current_stage": stage,
+            "last_error": None,
+        }
+
+        if refined_score > best_score:
+            best_dataset_file: str = _state_value(state, "best_dataset_file", BEST_DATASET_FILE)
+            _save_best_dataset(dataset, best_dataset_file)
+            updates.update(
+                {
+                    "best_dataset": dataset,
+                    "best_results": results,
+                    "best_score": refined_score,
+                    "stagnation_count": 0,
+                }
+            )
+        else:
+            updates["stagnation_count"] = stagnation_count + 1
+
+        return updates
+    except Exception as exc:
+        return _node_error(stage, exc)
+
+
+def finalize(state: AgentState) -> AgentState:
+    """Mark graph execution complete and preserve the final state summary."""
+    stop_reason = state.get("stop_reason")
+    if not stop_reason:
+        stop_reason = "complete"
+    return {
+        "current_stage": "finalize",
+        "stop_reason": stop_reason,
+    }
+
+
+def _route_after_stage(state: AgentState, next_node: str) -> str:
+    """Route to finalize after an error, otherwise continue to the next node."""
+    if state.get("last_error") or state.get("stop_reason") == "error":
+        return "finalize"
+    return next_node
+
+
+def _route_after_decision(state: AgentState) -> str:
+    """Route after the policy decision node."""
+    if state.get("last_error") or state.get("stop_reason"):
+        return "finalize"
+    return "refine_dataset"
+
+
+def _ensure_sqlite_metadata_serializer(checkpointer: SqliteSaver) -> None:
+    """Patch older sqlite checkpointers to work with newer LangGraph serializers."""
+    serializer = checkpointer.jsonplus_serde
+    if hasattr(serializer, "dumps") and hasattr(serializer, "loads"):
+        return
+
+    def dump_metadata(value: Any) -> bytes:
+        return dumps(value).encode("utf-8")
+
+    def load_metadata(value: bytes | str) -> Any:
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        return loads(value)
+
+    serializer.dumps = dump_metadata  # type: ignore[attr-defined]
+    serializer.loads = load_metadata  # type: ignore[attr-defined]
+
+
+def build_prompt_evaluation_agent(checkpoint_db: str = "langgraph_checkpoints.sqlite") -> Any:
+    """Build and compile the LangGraph prompt-evaluation agent."""
+    workflow = StateGraph(AgentState)
+
+    workflow.add_node("load_or_generate_dataset", load_or_generate_dataset)
+    workflow.add_node("load_or_generate_solutions", load_or_generate_solutions)
+    workflow.add_node("load_or_evaluate_solutions", load_or_evaluate_solutions)
+    workflow.add_node("initialize_best", initialize_best)
+    workflow.add_node("decide_next_step", decide_next_step)
+    workflow.add_node("refine_dataset", refine_dataset)
+    workflow.add_node("generate_refined_solutions", generate_refined_solutions)
+    workflow.add_node("evaluate_refined_solutions", evaluate_refined_solutions)
+    workflow.add_node("update_best_or_stagnation", update_best_or_stagnation)
+    workflow.add_node("finalize", finalize)
+
+    workflow.add_edge(START, "load_or_generate_dataset")
+    workflow.add_conditional_edges(
+        "load_or_generate_dataset",
+        lambda state: _route_after_stage(state, "load_or_generate_solutions"),
+        {"load_or_generate_solutions": "load_or_generate_solutions", "finalize": "finalize"},
+    )
+    workflow.add_conditional_edges(
+        "load_or_generate_solutions",
+        lambda state: _route_after_stage(state, "load_or_evaluate_solutions"),
+        {"load_or_evaluate_solutions": "load_or_evaluate_solutions", "finalize": "finalize"},
+    )
+    workflow.add_conditional_edges(
+        "load_or_evaluate_solutions",
+        lambda state: _route_after_stage(state, "initialize_best"),
+        {"initialize_best": "initialize_best", "finalize": "finalize"},
+    )
+    workflow.add_conditional_edges(
+        "initialize_best",
+        lambda state: _route_after_stage(state, "decide_next_step"),
+        {"decide_next_step": "decide_next_step", "finalize": "finalize"},
+    )
+    workflow.add_conditional_edges(
+        "decide_next_step",
+        _route_after_decision,
+        {"refine_dataset": "refine_dataset", "finalize": "finalize"},
+    )
+    workflow.add_conditional_edges(
+        "refine_dataset",
+        lambda state: _route_after_stage(state, "generate_refined_solutions"),
+        {"generate_refined_solutions": "generate_refined_solutions", "finalize": "finalize"},
+    )
+    workflow.add_conditional_edges(
+        "generate_refined_solutions",
+        lambda state: _route_after_stage(state, "evaluate_refined_solutions"),
+        {"evaluate_refined_solutions": "evaluate_refined_solutions", "finalize": "finalize"},
+    )
+    workflow.add_conditional_edges(
+        "evaluate_refined_solutions",
+        lambda state: _route_after_stage(state, "update_best_or_stagnation"),
+        {"update_best_or_stagnation": "update_best_or_stagnation", "finalize": "finalize"},
+    )
+    workflow.add_conditional_edges(
+        "update_best_or_stagnation",
+        lambda state: _route_after_stage(state, "decide_next_step"),
+        {"decide_next_step": "decide_next_step", "finalize": "finalize"},
+    )
+    workflow.add_edge("finalize", END)
+
+    conn = sqlite3.connect(checkpoint_db, check_same_thread=False)
+    checkpointer = SqliteSaver(conn)
+    _ensure_sqlite_metadata_serializer(checkpointer)
+    checkpointer.setup()
+    return workflow.compile(checkpointer=checkpointer)
 
 
 def main(
     score_threshold: float = SCORE_THRESHOLD,
     max_iterations: int = MAX_REFINEMENT_ITERATIONS,
     max_stagnation: int = MAX_STAGNATION_ITERATIONS,
+    thread_id: str = "prompt-evaluation",
+    checkpoint_db: str = "langgraph_checkpoints.sqlite",
 ) -> None:
-    """Run the prompt evaluation pipeline with iterative refinement.
+    """Run the LangGraph prompt-evaluation agent with iterative refinement.
 
-    Performs an initial pass (dataset generation → solution generation →
-    evaluation), then repeatedly refines the dataset and re-evaluates until
-    the mean evaluation score reaches ``score_threshold``,
-    ``max_iterations`` is exhausted, or ``max_stagnation`` consecutive
-    non-improving iterations occur.
-
-    Each refinement iteration starts from the best-scoring dataset seen so
-    far, not necessarily the most recent one. If a refinement produces a
-    lower score than the current best, the best dataset is kept unchanged
-    and the next iteration refines from it again. Whenever the best score
-    improves, ``best_dataset.json`` is updated.
-
-    Each refinement iteration writes its own set of output files suffixed
-    with the iteration number (e.g. ``refined_dataset_1.json``,
-    ``refined_solutions_1.json``, ``refined_evaluation_results_1.json``),
-    so every pass is independently cached and inspectable.
+    The graph performs the same artifact-producing work as the previous
+    pipeline while LangGraph owns orchestration state, deterministic routing,
+    and SQLite-backed checkpointing.
 
     Args:
         score_threshold (float): Target mean score (1–10). Refinement stops once
@@ -773,61 +1193,42 @@ def main(
             Defaults to the module-level ``MAX_REFINEMENT_ITERATIONS``.
         max_stagnation (int): Stop early after this many consecutive non-improving
             iterations. Defaults to the module-level ``MAX_STAGNATION_ITERATIONS``.
+        thread_id (str): LangGraph checkpoint thread ID used for resumable runs.
+        checkpoint_db (str): SQLite database path used for LangGraph checkpoints.
     """
-    print("=== Initial pass ===")
+    print("=== LangGraph prompt-evaluation agent ===")
+    print(f"Thread: {thread_id}")
+    print(f"Checkpoint DB: {checkpoint_db}")
 
-    dataset: list[dict[str, str]] = EvaluationDatasetGenerator(ClaudeClient(model=DATASET_MODEL)).create_dataset()
-    solutions: list[dict[str, str]] = SolutionGenerator(ClaudeClient()).generate_solutions(dataset)
-    evaluation_results: list[dict[str, Any]] = PromptEvaluator(ClaudeClient()).evaluate_prompts(dataset, solutions)
+    graph = build_prompt_evaluation_agent(checkpoint_db=checkpoint_db)
+    initial_state: AgentState = {
+        "score_threshold": score_threshold,
+        "max_iterations": max_iterations,
+        "max_stagnation": max_stagnation,
+        "iteration": 0,
+        "stagnation_count": 0,
+        "dataset_file": EvaluationDatasetGenerator.DATASET_FILE,
+        "solutions_file": SolutionGenerator.DEFAULT_SOLUTIONS_FILE,
+        "evaluation_file": PromptEvaluator.DEFAULT_EVALUATION_FILE,
+        "best_dataset_file": BEST_DATASET_FILE,
+        "refined_dataset_pattern": "refined_dataset_{iteration}.json",
+        "refined_solutions_pattern": "refined_solutions_{iteration}.json",
+        "refined_evaluation_pattern": "refined_evaluation_results_{iteration}.json",
+    }
+    config = {"configurable": {"thread_id": thread_id}}
+    final_state: AgentState = graph.invoke(initial_state, config)
 
-    best_dataset: list[dict[str, str]] = dataset
-    best_results: list[dict[str, Any]] = evaluation_results
-    best_score: float = _mean_score(evaluation_results)
-    _save_best_dataset(best_dataset)
+    if final_state.get("last_error"):
+        print(f"Stopped with error at {final_state.get('current_stage')}: {final_state['last_error']}")
+        return
 
-    stagnation_count: int = 0
-
-    for iteration in range(1, max_iterations + 1):
-        print(f"\nBest mean score so far: {best_score:.2f} / {score_threshold:.2f} threshold")
-
-        if best_score >= score_threshold:
-            print(f"Threshold reached after {iteration - 1} refinement(s).")
-            break
-
-        print(f"=== Refinement pass {iteration} (refining from best, score {best_score:.2f}) ===")
-
-        refined_dataset: list[dict[str, str]] = TaskRefiner(
-            ClaudeClient(),
-            output_file=f"refined_dataset_{iteration}.json",
-        ).refine_dataset(best_dataset, best_results)
-
-        refined_solutions: list[dict[str, str]] = SolutionGenerator(
-            ClaudeClient(),
-            output_file=f"refined_solutions_{iteration}.json",
-        ).generate_solutions(refined_dataset)
-
-        refined_results: list[dict[str, Any]] = PromptEvaluator(
-            ClaudeClient(),
-            output_file=f"refined_evaluation_results_{iteration}.json",
-        ).evaluate_prompts(refined_dataset, refined_solutions)
-
-        refined_score: float = _mean_score(refined_results)
-
-        if refined_score > best_score:
-            best_score = refined_score
-            best_dataset = refined_dataset
-            best_results = refined_results
-            stagnation_count = 0
-            _save_best_dataset(best_dataset)
-            print(f"New best score: {best_score:.2f} — {BEST_DATASET_FILE} updated.")
-        else:
-            stagnation_count += 1
-            print(f"Score did not improve ({refined_score:.2f} <= {best_score:.2f}), stagnation {stagnation_count}/{max_stagnation}.")
-            if stagnation_count >= max_stagnation:
-                print(f"No improvement for {max_stagnation} consecutive refinement(s), stopping early.")
-                break
-    else:
-        print(f"\nStopped after {max_iterations} refinement(s) (best score: {best_score:.2f}).")
+    best_score = float(_state_value(final_state, "best_score", 0.0))
+    iteration = int(_state_value(final_state, "iteration", 0))
+    stop_reason = _state_value(final_state, "stop_reason", "complete")
+    print(f"Stopped: {stop_reason}")
+    print(f"Best mean score: {best_score:.2f}")
+    print(f"Refinement passes completed: {iteration}")
+    print(f"Best dataset: {_state_value(final_state, 'best_dataset_file', BEST_DATASET_FILE)}")
 
 
 class PipelineArgs:
@@ -859,6 +1260,18 @@ class PipelineArgs:
             metavar="N",
             help=f"stop after N consecutive non-improving iterations (default: {MAX_STAGNATION_ITERATIONS})",
         )
+        parser.add_argument(
+            "--thread-id",
+            type=str,
+            default="prompt-evaluation",
+            help="LangGraph checkpoint thread ID used for resumable runs",
+        )
+        parser.add_argument(
+            "--checkpoint-db",
+            type=str,
+            default="langgraph_checkpoints.sqlite",
+            help="SQLite database path used for LangGraph checkpoints",
+        )
         self.__args = parser.parse_args()
 
     @property
@@ -876,7 +1289,23 @@ class PipelineArgs:
         """int: Maximum consecutive non-improving iterations supplied via ``--stagnation``."""
         return self.__args.stagnation
 
+    @property
+    def thread_id(self) -> str:
+        """str: LangGraph checkpoint thread ID supplied via ``--thread-id``."""
+        return self.__args.thread_id
+
+    @property
+    def checkpoint_db(self) -> str:
+        """str: SQLite checkpoint database path supplied via ``--checkpoint-db``."""
+        return self.__args.checkpoint_db
+
 
 if __name__ == "__main__":
     args = PipelineArgs()
-    main(score_threshold=args.score, max_iterations=args.iterations, max_stagnation=args.stagnation)
+    main(
+        score_threshold=args.score,
+        max_iterations=args.iterations,
+        max_stagnation=args.stagnation,
+        thread_id=args.thread_id,
+        checkpoint_db=args.checkpoint_db,
+    )
