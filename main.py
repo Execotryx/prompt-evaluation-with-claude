@@ -26,15 +26,36 @@ import os
 import math
 import argparse
 import sqlite3
+import re
+import uuid
 import anthropic
 from abc import ABC, abstractmethod
 from collections.abc import Hashable
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from dotenv import load_dotenv
-from typing import Literal, Any, TypedDict, cast
+from pathlib import Path
+from typing import Literal, Any, Protocol, TypeVar, TypedDict, cast
 from json import dumps, loads
 from tqdm import tqdm
 from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.sqlite import SqliteSaver
+from run_storage import (
+    BEST_DATASET_FILE,
+    DATASET_FILE as INITIAL_DATASET_FILE,
+    DEFAULT_CHECKPOINT_DB,
+    DEFAULT_RUNS_ROOT,
+    EVALUATION_FILE as INITIAL_EVALUATION_FILE,
+    RUN_ARCHIVE_FILE,
+    RUN_MANIFEST_FILE,
+    SOLUTIONS_FILE as INITIAL_SOLUTIONS_FILE,
+    RunArtifactPaths,
+    create_run_archive,
+    load_manifest,
+    utc_timestamp,
+    write_manifest,
+)
 
 MODEL: str = "claude-sonnet-4-6"
 DATASET_MODEL: str = "claude-haiku-4-5"
@@ -42,12 +63,29 @@ MAX_TOKENS: int = 1024
 SCORE_THRESHOLD: float = 9.5
 MAX_REFINEMENT_ITERATIONS: int = 10
 MAX_STAGNATION_ITERATIONS: int = 3
-BEST_DATASET_FILE: str = "best_dataset.json"
+DEMO_THREAD_ID: str = "prompt-evaluation-demo"
+DEMO_ARTIFACTS: RunArtifactPaths = RunArtifactPaths.in_directory(".", prefix="demo_")
+DEMO_SOURCE_ARTIFACTS: RunArtifactPaths = RunArtifactPaths.in_directory(Path(__file__).parent / "demo_data")
+DEMO_DATASET_FILE: str = str(DEMO_ARTIFACTS.dataset)
+DEMO_SOLUTIONS_FILE: str = str(DEMO_ARTIFACTS.solutions)
+DEMO_EVALUATION_FILE: str = str(DEMO_ARTIFACTS.evaluation)
+DEMO_BEST_DATASET_FILE: str = str(DEMO_ARTIFACTS.best_dataset)
+DEMO_REFINED_DATASET_PATTERN: str = str(DEMO_ARTIFACTS.refined_dataset_pattern)
+DEMO_REFINED_SOLUTIONS_PATTERN: str = str(DEMO_ARTIFACTS.refined_solutions_pattern)
+DEMO_REFINED_EVALUATION_PATTERN: str = str(DEMO_ARTIFACTS.refined_evaluation_pattern)
+DEMO_CHECKPOINT_DB: str = str(DEMO_ARTIFACTS.checkpoint)
+DEMO_SOURCE_DATASET_FILE: str = str(DEMO_SOURCE_ARTIFACTS.dataset)
+DEMO_SOURCE_SOLUTIONS_FILE: str = str(DEMO_SOURCE_ARTIFACTS.solutions)
+DEMO_SOURCE_EVALUATION_FILE: str = str(DEMO_SOURCE_ARTIFACTS.evaluation)
+DEMO_SOURCE_REFINED_DATASET_PATTERN: str = str(DEMO_SOURCE_ARTIFACTS.refined_dataset_pattern)
+DEMO_SOURCE_REFINED_SOLUTIONS_PATTERN: str = str(DEMO_SOURCE_ARTIFACTS.refined_solutions_pattern)
+DEMO_SOURCE_REFINED_EVALUATION_PATTERN: str = str(DEMO_SOURCE_ARTIFACTS.refined_evaluation_pattern)
 DATASET_TOKEN_MULTIPLIER: float = 2.0
 SOLUTION_TOKEN_MULTIPLIER: float = 2.0
 EVALUATION_TOKEN_MULTIPLIER: float = 1.0
 REFINEMENT_TOKEN_MULTIPLIER: float = 2.0
 MAX_TOKEN_CORRECTIONS: int = 3
+ValidatedArtifact = TypeVar("ValidatedArtifact")
 
 
 class ClaudeClient:
@@ -228,7 +266,7 @@ class EvaluationDatasetGenerator(BaseAgent):
     the model is only called once unless the file is deleted.
     """
 
-    DATASET_FILE: str = "evaluation_dataset.json"
+    DATASET_FILE: str = INITIAL_DATASET_FILE
 
     def __init__(self, client: ClaudeClient, output_file: str | None = None) -> None:
         """Initialise the generator with a model client and optional output path.
@@ -323,7 +361,7 @@ class SolutionGenerator(BaseAgent):
     On subsequent runs the file is loaded directly, skipping model calls.
     """
 
-    DEFAULT_SOLUTIONS_FILE: str = "solutions.json"
+    DEFAULT_SOLUTIONS_FILE: str = INITIAL_SOLUTIONS_FILE
 
     def __init__(self, client: ClaudeClient, output_file: str | None = None) -> None:
         """Initialise the generator with a model client and optional output path.
@@ -446,7 +484,7 @@ class PromptEvaluator(BaseAgent):
     ``TaskRefiner`` — can match results back to their source tasks by name.
     """
 
-    DEFAULT_EVALUATION_FILE: str = "evaluation_results.json"
+    DEFAULT_EVALUATION_FILE: str = INITIAL_EVALUATION_FILE
 
     def __init__(self, client: ClaudeClient, output_file: str | None = None) -> None:
         """Initialise the evaluator with a model client and optional output path.
@@ -816,6 +854,7 @@ def _save_best_dataset(dataset: list[dict[str, str]], output_file: str = BEST_DA
 class AgentState(TypedDict, total=False):
     """Shared LangGraph state for the prompt-evaluation agent."""
 
+    demo_mode: bool
     dataset: list[dict[str, str]]
     solutions: list[dict[str, str]]
     evaluation_results: list[dict[str, Any]]
@@ -899,6 +938,37 @@ class FinalState(TypedDict):
     stop_reason: str
 
 
+class RunResult(TypedDict):
+    """Summary returned after a live or demo invocation."""
+
+    run_id: str | None
+    run_directory: str | None
+    archive_path: str | None
+    download_link: str | None
+    status: str
+    stop_reason: str
+
+
+class DownloadLinkProvider(Protocol):
+    """Builds a downloadable link for a finalized run archive."""
+
+    def create_download_link(self, run_id: str, archive_path: Path) -> str | None:
+        """Return a downloadable link for a run archive."""
+        ...
+
+
+class BaseUrlDownloadLinkProvider:
+    """Builds run archive links beneath a configured public base URL."""
+
+    def __init__(self, base_url: str) -> None:
+        """Store the public base URL used for run archive links."""
+        self._base_url: str = base_url.rstrip("/")
+
+    def create_download_link(self, run_id: str, archive_path: Path) -> str:
+        """Return the public URL for a run archive."""
+        return f"{self._base_url}/{run_id}/{archive_path.name}"
+
+
 def _state_value(state: AgentState, key: str, default: Any) -> Any:
     """Return a state value, falling back only when the key is absent or None.
 
@@ -930,6 +1000,31 @@ def _refined_artifact_path(state: AgentState, key: str, default_pattern: str) ->
     return pattern.format(iteration=next_iteration)
 
 
+def _validate_record_list(records: Any, collection_label: str, item_label: str) -> list[dict[str, Any]]:
+    """Validate common non-empty record-list and task fields.
+
+    Args:
+        records (Any): Candidate record list.
+        collection_label (str): Human-readable collection label for errors.
+        item_label (str): Human-readable singular record label for errors.
+
+    Returns:
+        list[dict[str, Any]]: Records with validated object and task fields.
+
+    Raises:
+        ValueError: If the list or a common record field is invalid.
+    """
+    if not isinstance(records, list) or not records:
+        raise ValueError(f"{collection_label} must be a non-empty list.")
+
+    for index, item in enumerate(records):
+        if not isinstance(item, dict):
+            raise ValueError(f"{item_label} {index} must be an object.")
+        if not isinstance(item.get("task"), str) or not item["task"]:
+            raise ValueError(f"{item_label} {index} must include a non-empty task string.")
+    return records
+
+
 def _validate_dataset(dataset: Any) -> list[dict[str, str]]:
     """Validate a task dataset before accepting it into graph state.
 
@@ -943,18 +1038,12 @@ def _validate_dataset(dataset: Any) -> list[dict[str, str]]:
     Raises:
         ValueError: If the dataset is empty or any item has an invalid shape.
     """
-    if not isinstance(dataset, list) or not dataset:
-        raise ValueError("Dataset must be a non-empty list.")
-
-    for index, item in enumerate(dataset):
-        if not isinstance(item, dict):
-            raise ValueError(f"Dataset item {index} must be an object.")
-        if not isinstance(item.get("task"), str) or not item["task"]:
-            raise ValueError(f"Dataset item {index} must include a non-empty task string.")
+    records: list[dict[str, Any]] = _validate_record_list(dataset, "Dataset", "Dataset item")
+    for index, item in enumerate(records):
         if not isinstance(item.get("solution_criteria"), str) or not item["solution_criteria"]:
             raise ValueError(f"Dataset item {index} must include a non-empty solution_criteria string.")
 
-    return dataset
+    return cast(list[dict[str, str]], records)
 
 
 def _validate_solutions(solutions: Any) -> list[dict[str, str]]:
@@ -970,18 +1059,12 @@ def _validate_solutions(solutions: Any) -> list[dict[str, str]]:
     Raises:
         ValueError: If the solution list is empty or any item has an invalid shape.
     """
-    if not isinstance(solutions, list) or not solutions:
-        raise ValueError("Solutions must be a non-empty list.")
-
-    for index, item in enumerate(solutions):
-        if not isinstance(item, dict):
-            raise ValueError(f"Solution item {index} must be an object.")
-        if not isinstance(item.get("task"), str) or not item["task"]:
-            raise ValueError(f"Solution item {index} must include a non-empty task string.")
+    records: list[dict[str, Any]] = _validate_record_list(solutions, "Solutions", "Solution item")
+    for index, item in enumerate(records):
         if not isinstance(item.get("solution"), str) or not item["solution"]:
             raise ValueError(f"Solution item {index} must include a non-empty solution string.")
 
-    return solutions
+    return cast(list[dict[str, str]], records)
 
 
 def _validate_evaluation_results(results: Any) -> list[dict[str, Any]]:
@@ -998,14 +1081,12 @@ def _validate_evaluation_results(results: Any) -> list[dict[str, Any]]:
     Raises:
         ValueError: If the result list is empty or any item has an invalid shape.
     """
-    if not isinstance(results, list) or not results:
-        raise ValueError("Evaluation results must be a non-empty list.")
-
-    for index, item in enumerate(results):
-        if not isinstance(item, dict):
-            raise ValueError(f"Evaluation result {index} must be an object.")
-        if not isinstance(item.get("task"), str) or not item["task"]:
-            raise ValueError(f"Evaluation result {index} must include a non-empty task string.")
+    records: list[dict[str, Any]] = _validate_record_list(
+        results,
+        "Evaluation results",
+        "Evaluation result",
+    )
+    for index, item in enumerate(records):
         if isinstance(item.get("score"), bool) or not isinstance(item.get("score"), (int, float)):
             raise ValueError(f"Evaluation result {index} must include a numeric score.")
         if not isinstance(item.get("strengths"), list):
@@ -1013,7 +1094,121 @@ def _validate_evaluation_results(results: Any) -> list[dict[str, Any]]:
         if not isinstance(item.get("weaknesses"), list):
             raise ValueError(f"Evaluation result {index} must include a weaknesses list.")
 
-    return results
+    return records
+
+
+def _load_or_create_json(output_file: str, payload: Any) -> Any:
+    """Load a JSON artifact if present, otherwise write and return a default payload.
+
+    Args:
+        output_file (str): Artifact path to read or create.
+        payload (Any): JSON-serializable fallback payload.
+
+    Returns:
+        Any: Existing decoded JSON or the fallback payload after it is written.
+    """
+    if os.path.exists(output_file):
+        with open(output_file, "r") as f:
+            return loads(f.read())
+
+    with open(output_file, "w") as f:
+        f.write(dumps(payload, indent=4))
+    return payload
+
+
+def _load_demo_source(source_file: str) -> Any:
+    """Load a checked-in artifact produced by a real AI run.
+
+    Args:
+        source_file (str): Real-run artifact path to load.
+
+    Returns:
+        Any: Decoded JSON artifact.
+
+    Raises:
+        FileNotFoundError: If the required real-run artifact is missing.
+    """
+    if not os.path.exists(source_file):
+        raise FileNotFoundError(f"Demo mode requires real-run artifact: {source_file}")
+    with open(source_file, "r") as f:
+        return loads(f.read())
+
+
+def _replay_demo_artifact(
+    source_file: str,
+    output_file: str,
+    validator: Callable[[Any], ValidatedArtifact],
+) -> ValidatedArtifact:
+    """Replay, cache, and validate one checked-in real-run artifact."""
+    payload: Any = _load_demo_source(source_file)
+    return validator(_load_or_create_json(output_file, payload))
+
+
+def _demo_dataset(output_file: str) -> list[dict[str, str]]:
+    """Replay the initial dataset from a real AI run.
+
+    Args:
+        output_file (str): Artifact path used for demo cache behavior.
+
+    Returns:
+        list[dict[str, str]]: Validated AWS coding task records.
+    """
+    return _replay_demo_artifact(DEMO_SOURCE_DATASET_FILE, output_file, _validate_dataset)
+
+
+def _demo_solutions(output_file: str, iteration: int | None = None) -> list[dict[str, str]]:
+    """Replay initial or refined solutions from a real AI run.
+
+    Args:
+        output_file (str): Artifact path used for demo cache behavior.
+        iteration (int | None): Refined iteration number, or ``None`` for the
+            initial solutions.
+
+    Returns:
+        list[dict[str, str]]: Validated solution records.
+    """
+    source_file: str = (
+        DEMO_SOURCE_SOLUTIONS_FILE
+        if iteration is None
+        else DEMO_SOURCE_REFINED_SOLUTIONS_PATTERN.format(iteration=iteration)
+    )
+    return _replay_demo_artifact(source_file, output_file, _validate_solutions)
+
+
+def _demo_evaluation_results(
+    output_file: str,
+    iteration: int | None = None,
+) -> list[dict[str, Any]]:
+    """Replay initial or refined evaluation results from a real AI run.
+
+    Args:
+        output_file (str): Artifact path used for demo cache behavior.
+        iteration (int | None): Refined iteration number, or ``None`` for the
+            initial evaluation.
+
+    Returns:
+        list[dict[str, Any]]: Validated evaluation records.
+    """
+    source_file: str = (
+        DEMO_SOURCE_EVALUATION_FILE
+        if iteration is None
+        else DEMO_SOURCE_REFINED_EVALUATION_PATTERN.format(iteration=iteration)
+    )
+    return _replay_demo_artifact(source_file, output_file, _validate_evaluation_results)
+
+
+def _demo_refined_dataset(output_file: str, iteration: int) -> list[dict[str, str]]:
+    """Replay one refined dataset from a real AI run.
+
+    Args:
+        output_file (str): Artifact path used for demo cache behavior.
+        iteration (int): Refined iteration number to replay.
+
+    Returns:
+        list[dict[str, str]]: Validated refined task records.
+    """
+    source_file: str = DEMO_SOURCE_REFINED_DATASET_PATTERN.format(iteration=iteration)
+    return _replay_demo_artifact(source_file, output_file, _validate_dataset)
 
 
 def _stage_success(stage: str, updates: StageSuccessState | None = None) -> AgentState:
@@ -1131,6 +1326,9 @@ def load_or_generate_dataset(state: AgentState) -> AgentState:
     stage = "load_or_generate_dataset"
     try:
         dataset_file: str = _state_value(state, "dataset_file", EvaluationDatasetGenerator.DATASET_FILE)
+        if bool(_state_value(state, "demo_mode", False)):
+            return _stage_success(stage, {"dataset": _demo_dataset(dataset_file)})
+
         token_multiplier: float = float(_state_value(state, "dataset_token_multiplier", DATASET_TOKEN_MULTIPLIER))
         dataset: list[dict[str, Any]] = EvaluationDatasetGenerator(
             ClaudeClient(model=DATASET_MODEL),
@@ -1156,6 +1354,14 @@ def _generate_solutions_node(state: AgentState, stage: str, output_file: str) ->
     """
     try:
         dataset: list[dict[str, str]] = _validate_dataset(state.get("dataset"))
+        if bool(_state_value(state, "demo_mode", False)):
+            iteration: int | None = (
+                int(_state_value(state, "iteration", 0)) + 1
+                if stage == "generate_refined_solutions"
+                else None
+            )
+            return _stage_success(stage, {"solutions": _demo_solutions(output_file, iteration)})
+
         token_multiplier: float = float(_state_value(state, "solution_token_multiplier", SOLUTION_TOKEN_MULTIPLIER))
         solutions: list[dict[str, str]] = SolutionGenerator(
             ClaudeClient(),
@@ -1198,6 +1404,14 @@ def _evaluate_solutions_node(state: AgentState, stage: str, output_file: str) ->
     try:
         dataset: list[dict[str, str]] = _validate_dataset(state.get("dataset"))
         solutions: list[dict[str, str]] = _validate_solutions(state.get("solutions"))
+        if bool(_state_value(state, "demo_mode", False)):
+            iteration: int | None = (
+                int(_state_value(state, "iteration", 0)) + 1
+                if stage == "evaluate_refined_solutions"
+                else None
+            )
+            return _stage_success(stage, {"evaluation_results": _demo_evaluation_results(output_file, iteration)})
+
         token_multiplier: float = float(_state_value(state, "evaluation_token_multiplier", EVALUATION_TOKEN_MULTIPLIER))
         results: list[dict[str, Any]] = PromptEvaluator(
             ClaudeClient(),
@@ -1307,6 +1521,10 @@ def refine_dataset(state: AgentState) -> AgentState:
         best_dataset: list[dict[str, str]] = _validate_dataset(state.get("best_dataset"))
         best_results: list[dict[str, Any]] = _validate_evaluation_results(state.get("best_results"))
         output_file: str = _refined_artifact_path(state, "refined_dataset_pattern", "refined_dataset_{iteration}.json")
+        if bool(_state_value(state, "demo_mode", False)):
+            iteration: int = int(_state_value(state, "iteration", 0)) + 1
+            return _stage_success(stage, {"dataset": _demo_refined_dataset(output_file, iteration)})
+
         token_multiplier: float = float(_state_value(state, "refinement_token_multiplier", REFINEMENT_TOKEN_MULTIPLIER))
         dataset: list[dict[str, str]] = TaskRefiner(
             ClaudeClient(),
@@ -1723,7 +1941,7 @@ def _compile_graph(workflow: StateGraph, checkpoint_db: str) -> Any:
     return workflow.compile(checkpointer=checkpointer)
 
 
-def build_prompt_evaluation_agent(checkpoint_db: str = "langgraph_checkpoints.sqlite") -> Any:
+def build_prompt_evaluation_agent(checkpoint_db: str = DEFAULT_CHECKPOINT_DB) -> Any:
     """Build and compile the LangGraph prompt-evaluation agent.
 
     Args:
@@ -1740,18 +1958,144 @@ def build_prompt_evaluation_agent(checkpoint_db: str = "langgraph_checkpoints.sq
     return _compile_graph(workflow, checkpoint_db)
 
 
+def _generate_run_id() -> str:
+    """Return a filesystem-safe unique live-run identifier."""
+    timestamp: str = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{timestamp}-{uuid.uuid4().hex[:8]}"
+
+
+def _validate_run_id(run_id: str) -> str:
+    """Validate and return a run identifier.
+
+    Args:
+        run_id (str): Candidate run identifier.
+
+    Returns:
+        str: Validated run identifier.
+
+    Raises:
+        ValueError: If the identifier could escape the runs root.
+    """
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", run_id) is None:
+        raise ValueError(f"Invalid run ID: {run_id!r}")
+    return run_id
+
+
+def _cli_download_link_provider(base_url: str | None) -> DownloadLinkProvider | None:
+    """Build the CLI-configured download-link provider.
+
+    Args:
+        base_url (str | None): Explicit CLI base URL.
+
+    Returns:
+        DownloadLinkProvider | None: Base-URL provider when configured via the
+        CLI or ``DOWNLOAD_BASE_URL`` environment variable.
+    """
+    load_dotenv()
+    resolved_base_url: str | None = base_url or os.getenv("DOWNLOAD_BASE_URL")
+    if not resolved_base_url:
+        return None
+    return BaseUrlDownloadLinkProvider(resolved_base_url)
+
+
+def _prepare_live_run(
+    runs_root: str,
+    resume_run_id: str | None,
+    thread_id: str | None,
+) -> tuple[str, Path, str, dict[str, Any], RunArtifactPaths]:
+    """Create or reopen an isolated live-run directory.
+
+    Args:
+        runs_root (str): Parent directory for live runs.
+        resume_run_id (str | None): Existing run ID to reopen.
+        thread_id (str | None): Explicit checkpoint thread ID.
+
+    Returns:
+        tuple[str, Path, str, dict[str, Any], RunArtifactPaths]: Run ID,
+        directory, resolved thread ID, manifest, and artifact paths.
+    """
+    root: Path = Path(runs_root).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+
+    if resume_run_id is not None:
+        run_id: str = _validate_run_id(resume_run_id)
+        run_directory: Path = (root / run_id).resolve()
+        if run_directory.parent != root or not run_directory.is_dir():
+            raise FileNotFoundError(f"Run not found for resume: {run_id}")
+        artifact_paths: RunArtifactPaths = RunArtifactPaths.in_directory(run_directory)
+        manifest: dict[str, Any] = load_manifest(artifact_paths.manifest)
+        resolved_thread_id: str = thread_id or str(manifest.get("thread_id") or run_id)
+        return run_id, run_directory, resolved_thread_id, manifest, artifact_paths
+
+    while True:
+        run_id = _generate_run_id()
+        run_directory = root / run_id
+        try:
+            run_directory.mkdir()
+            break
+        except FileExistsError:
+            continue
+
+    resolved_thread_id = thread_id or run_id
+    manifest = {
+        "run_id": run_id,
+        "created_at": utc_timestamp(),
+        "updated_at": utc_timestamp(),
+        "status": "running",
+        "thread_id": resolved_thread_id,
+    }
+    resolved_directory: Path = run_directory.resolve()
+    return (
+        run_id,
+        resolved_directory,
+        resolved_thread_id,
+        manifest,
+        RunArtifactPaths.in_directory(resolved_directory),
+    )
+
+
+def _finalize_live_run(
+    manifest: dict[str, Any],
+    artifact_paths: RunArtifactPaths,
+    *,
+    status: str,
+    stop_reason: str,
+    error: str | None,
+    best_score: float | None = None,
+    completed_iterations: int | None = None,
+) -> Path:
+    """Persist final live-run metadata and rebuild its downloadable archive."""
+    manifest.update(
+        {
+            "status": status,
+            "stop_reason": stop_reason,
+            "error": error,
+        }
+    )
+    if best_score is not None:
+        manifest["best_score"] = best_score
+    if completed_iterations is not None:
+        manifest["completed_iterations"] = completed_iterations
+    write_manifest(artifact_paths.manifest, manifest)
+    return create_run_archive(artifact_paths)
+
+
 def main(
     score_threshold: float = SCORE_THRESHOLD,
     max_iterations: int = MAX_REFINEMENT_ITERATIONS,
     max_stagnation: int = MAX_STAGNATION_ITERATIONS,
-    thread_id: str = "prompt-evaluation",
-    checkpoint_db: str = "langgraph_checkpoints.sqlite",
+    thread_id: str | None = None,
+    checkpoint_db: str | None = None,
     dataset_token_multiplier: float = DATASET_TOKEN_MULTIPLIER,
     solution_token_multiplier: float = SOLUTION_TOKEN_MULTIPLIER,
     evaluation_token_multiplier: float = EVALUATION_TOKEN_MULTIPLIER,
     refinement_token_multiplier: float = REFINEMENT_TOKEN_MULTIPLIER,
     max_token_corrections: int = MAX_TOKEN_CORRECTIONS,
-) -> None:
+    demo_mode: bool = False,
+    runs_root: str = DEFAULT_RUNS_ROOT,
+    resume_run_id: str | None = None,
+    download_link_provider: DownloadLinkProvider | None = None,
+) -> RunResult:
     """Run the LangGraph prompt-evaluation agent with iterative refinement.
 
     The graph performs the same artifact-producing work as the previous
@@ -1766,8 +2110,12 @@ def main(
             Defaults to the module-level ``MAX_REFINEMENT_ITERATIONS``.
         max_stagnation (int): Stop early after this many consecutive non-improving
             iterations. Defaults to the module-level ``MAX_STAGNATION_ITERATIONS``.
-        thread_id (str): LangGraph checkpoint thread ID used for resumable runs.
-        checkpoint_db (str): SQLite database path used for LangGraph checkpoints.
+        thread_id (str | None): LangGraph checkpoint thread ID used for
+            resumable runs. Defaults to the normal or demo thread based on
+            ``demo_mode``.
+        checkpoint_db (str | None): SQLite database path used for LangGraph
+            checkpoints. Defaults to the normal or demo database based on
+            ``demo_mode``.
         dataset_token_multiplier (float): Multiplier applied to ``MAX_TOKENS``
             for dataset-generation model calls.
         solution_token_multiplier (float): Multiplier applied to ``MAX_TOKENS``
@@ -1779,13 +2127,59 @@ def main(
         max_token_corrections (int): Maximum number of automatic corrections
             for max-token truncation errors. Each correction increases only the
             failed stage's multiplier by exactly ``1.0``.
+        demo_mode (bool): Run with deterministic local artifacts and no AI API
+            calls. Defaults to ``False``.
+        runs_root (str): Parent directory for isolated live-run folders.
+        resume_run_id (str | None): Existing live-run ID to resume.
+        download_link_provider (DownloadLinkProvider | None): Strategy used to
+            create a downloadable link after the run archive is finalized.
 
     Returns:
-        None.
+        RunResult: Run identity, archive location, download URL, and status.
     """
+    if demo_mode and resume_run_id is not None:
+        raise ValueError("--resume-run-id cannot be used with demo mode.")
+
+    run_id: str | None = None
+    run_directory: Path | None = None
+    manifest: dict[str, Any] | None = None
+    archive_path: Path | None = None
+
+    if demo_mode:
+        resolved_thread_id: str = thread_id or DEMO_THREAD_ID
+        resolved_checkpoint_db: str = checkpoint_db or DEMO_CHECKPOINT_DB
+        artifact_paths: RunArtifactPaths = DEMO_ARTIFACTS
+    else:
+        run_id, run_directory, resolved_thread_id, manifest, artifact_paths = _prepare_live_run(
+            runs_root,
+            resume_run_id,
+            thread_id,
+        )
+        resolved_checkpoint_db = checkpoint_db or str(artifact_paths.checkpoint)
+        manifest.update(
+            {
+                "status": "running",
+                "thread_id": resolved_thread_id,
+                "requested_limits": {
+                    "score_threshold": score_threshold,
+                    "max_iterations": max_iterations,
+                    "max_stagnation": max_stagnation,
+                    "max_token_corrections": max_token_corrections,
+                },
+                "artifacts": artifact_paths.manifest_artifacts(),
+            }
+        )
+        write_manifest(artifact_paths.manifest, manifest)
+
     print("=== LangGraph prompt-evaluation agent ===")
-    print(f"Thread: {thread_id}")
-    print(f"Checkpoint DB: {checkpoint_db}")
+    if demo_mode:
+        print("Mode: demo (no AI API calls)")
+    else:
+        print("Mode: live AI API")
+        print(f"Run ID: {run_id}")
+        print(f"Run directory: {run_directory}")
+    print(f"Thread: {resolved_thread_id}")
+    print(f"Checkpoint DB: {resolved_checkpoint_db}")
     print(
         "Token multipliers: "
         f"dataset={dataset_token_multiplier}, "
@@ -1794,8 +2188,10 @@ def main(
         f"refinement={refinement_token_multiplier}"
     )
 
-    graph: Any = build_prompt_evaluation_agent(checkpoint_db=checkpoint_db)
+    graph: Any = build_prompt_evaluation_agent(checkpoint_db=resolved_checkpoint_db)
+    state_artifact_paths: dict[str, str] = artifact_paths.state_paths()
     initial_state: AgentState = {
+        "demo_mode": demo_mode,
         "score_threshold": score_threshold,
         "max_iterations": max_iterations,
         "max_stagnation": max_stagnation,
@@ -1808,49 +2204,97 @@ def main(
         "stop_reason": None,
         "iteration": 0,
         "stagnation_count": 0,
-        "dataset_file": EvaluationDatasetGenerator.DATASET_FILE,
-        "solutions_file": SolutionGenerator.DEFAULT_SOLUTIONS_FILE,
-        "evaluation_file": PromptEvaluator.DEFAULT_EVALUATION_FILE,
-        "best_dataset_file": BEST_DATASET_FILE,
-        "refined_dataset_pattern": "refined_dataset_{iteration}.json",
-        "refined_solutions_pattern": "refined_solutions_{iteration}.json",
-        "refined_evaluation_pattern": "refined_evaluation_results_{iteration}.json",
+        "dataset_file": state_artifact_paths["dataset_file"],
+        "solutions_file": state_artifact_paths["solutions_file"],
+        "evaluation_file": state_artifact_paths["evaluation_file"],
+        "best_dataset_file": state_artifact_paths["best_dataset_file"],
+        "refined_dataset_pattern": state_artifact_paths["refined_dataset_pattern"],
+        "refined_solutions_pattern": state_artifact_paths["refined_solutions_pattern"],
+        "refined_evaluation_pattern": state_artifact_paths["refined_evaluation_pattern"],
         "dataset_token_multiplier": dataset_token_multiplier,
         "solution_token_multiplier": solution_token_multiplier,
         "evaluation_token_multiplier": evaluation_token_multiplier,
         "refinement_token_multiplier": refinement_token_multiplier,
     }
-    config: dict[str, dict[str, str]] = {"configurable": {"thread_id": thread_id}}
-    final_state: AgentState = graph.invoke(initial_state, config)
+    config: dict[str, dict[str, str]] = {"configurable": {"thread_id": resolved_thread_id}}
+    try:
+        final_state: AgentState = graph.invoke(initial_state, config)
+    except Exception as exc:
+        if manifest is not None:
+            archive_path = _finalize_live_run(
+                manifest,
+                artifact_paths,
+                status="failed",
+                stop_reason="error",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        raise
+    finally:
+        checkpointer: Any = getattr(graph, "checkpointer", None)
+        connection: Any = getattr(checkpointer, "conn", None)
+        if connection is not None:
+            connection.close()
 
     last_error: str | None = final_state.get("last_error")
     stop_reason: str = _state_value(final_state, "stop_reason", "complete")
+    best_score: float = float(_state_value(final_state, "best_score", 0.0))
+    iteration: int = int(_state_value(final_state, "iteration", 0))
+    status: str = "failed" if last_error or stop_reason == "error" else "completed"
+    checkpoint_error: str | None = None
+    if stop_reason == "error" and not last_error:
+        checkpoint_error = _latest_checkpoint_error(resolved_checkpoint_db, resolved_thread_id)
+    error_detail: str | None = last_error or checkpoint_error
+
+    if manifest is not None:
+        archive_path = _finalize_live_run(
+            manifest,
+            artifact_paths,
+            status=status,
+            stop_reason=stop_reason,
+            error=error_detail,
+            best_score=best_score,
+            completed_iterations=iteration,
+        )
+
     if last_error:
         failed_stage: str = _state_value(final_state, "failed_stage", _state_value(final_state, "current_stage", "unknown"))
         current_stage: str = _state_value(final_state, "current_stage", "unknown")
         print(f"Stopped with error in stage {failed_stage} (current stage: {current_stage}): {last_error}")
-        return
-
-    if stop_reason == "error":
+    elif stop_reason == "error":
         failed_stage: str = _state_value(final_state, "failed_stage", _state_value(final_state, "current_stage", "unknown"))
         current_stage: str = _state_value(final_state, "current_stage", "unknown")
-        checkpoint_error: str | None = _latest_checkpoint_error(checkpoint_db, thread_id)
         if checkpoint_error:
             print(f"Stopped with error in stage {failed_stage} (current stage: {current_stage}): {checkpoint_error}")
-            return
-        print(
-            f"Stopped with error in stage {failed_stage} (current stage: {current_stage}), "
-            "but no error details were present in the final graph state."
-        )
-        print("No non-empty last_error write was found in the checkpoint history.")
-        return
+        else:
+            print(
+                f"Stopped with error in stage {failed_stage} (current stage: {current_stage}), "
+                "but no error details were present in the final graph state."
+            )
+            print("No non-empty last_error write was found in the checkpoint history.")
+    else:
+        print(f"Stopped: {stop_reason}")
+        print(f"Best mean score: {best_score:.2f}")
+        print(f"Refinement passes completed: {iteration}")
+        print(f"Best dataset: {_state_value(final_state, 'best_dataset_file', BEST_DATASET_FILE)}")
 
-    best_score = float(_state_value(final_state, "best_score", 0.0))
-    iteration = int(_state_value(final_state, "iteration", 0))
-    print(f"Stopped: {stop_reason}")
-    print(f"Best mean score: {best_score:.2f}")
-    print(f"Refinement passes completed: {iteration}")
-    print(f"Best dataset: {_state_value(final_state, 'best_dataset_file', BEST_DATASET_FILE)}")
+    formed_download_link: str | None = None
+    if download_link_provider is not None and run_id is not None and archive_path is not None:
+        formed_download_link = download_link_provider.create_download_link(run_id, archive_path)
+    if run_directory is not None:
+        print(f"Run directory: {run_directory}")
+    if formed_download_link is not None:
+        print(f"Download link: {formed_download_link}")
+    elif archive_path is not None:
+        print(f"Download archive: {archive_path}")
+
+    return {
+        "run_id": run_id,
+        "run_directory": str(run_directory) if run_directory is not None else None,
+        "archive_path": str(archive_path) if archive_path is not None else None,
+        "download_link": formed_download_link,
+        "status": status,
+        "stop_reason": stop_reason,
+    }
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1864,6 +2308,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--score",
+        dest="score_threshold",
         type=float,
         default=SCORE_THRESHOLD,
         metavar="N",
@@ -1871,6 +2316,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--iterations",
+        dest="max_iterations",
         type=int,
         default=MAX_REFINEMENT_ITERATIONS,
         metavar="N",
@@ -1878,6 +2324,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--stagnation",
+        dest="max_stagnation",
         type=int,
         default=MAX_STAGNATION_ITERATIONS,
         metavar="N",
@@ -1886,14 +2333,44 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--thread-id",
         type=str,
-        default="prompt-evaluation",
-        help="LangGraph checkpoint thread ID used for resumable runs",
+        default=None,
+        help=(
+            "LangGraph checkpoint thread ID used for resumable runs "
+            f"(default: generated live run ID; demo: {DEMO_THREAD_ID})"
+        ),
     )
     parser.add_argument(
         "--checkpoint-db",
         type=str,
-        default="langgraph_checkpoints.sqlite",
-        help="SQLite database path used for LangGraph checkpoints",
+        default=None,
+        help=(
+            "SQLite database path used for LangGraph checkpoints "
+            f"(default: run-local {DEFAULT_CHECKPOINT_DB}; demo: {DEMO_CHECKPOINT_DB})"
+        ),
+    )
+    parser.add_argument(
+        "--demo",
+        dest="demo_mode",
+        action="store_true",
+        help="run a deterministic no-AI demo using demo-prefixed artifacts",
+    )
+    parser.add_argument(
+        "--runs-root",
+        type=str,
+        default=DEFAULT_RUNS_ROOT,
+        help=f"parent directory for isolated live runs (default: {DEFAULT_RUNS_ROOT})",
+    )
+    parser.add_argument(
+        "--resume-run-id",
+        type=str,
+        default=None,
+        help="resume an existing live run by its run ID",
+    )
+    parser.add_argument(
+        "--download-base-url",
+        type=str,
+        default=None,
+        help="public base URL for run ZIP downloads (fallback: DOWNLOAD_BASE_URL)",
     )
     parser.add_argument(
         "--dataset-token-multiplier",
@@ -1936,119 +2413,51 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-class PipelineArgs:
-    """Parses and exposes command-line arguments for the evaluation pipeline."""
+@dataclass(frozen=True)
+class PipelineConfig:
+    """Typed command-line configuration for one pipeline invocation."""
 
-    def __init__(self) -> None:
-        """Parse ``sys.argv`` and store the resulting namespace for property access.
+    score_threshold: float
+    max_iterations: int
+    max_stagnation: int
+    thread_id: str | None
+    checkpoint_db: str | None
+    demo_mode: bool
+    runs_root: str
+    resume_run_id: str | None
+    download_base_url: str | None
+    dataset_token_multiplier: float
+    solution_token_multiplier: float
+    evaluation_token_multiplier: float
+    refinement_token_multiplier: float
+    max_token_corrections: int
 
-        Returns:
-            None.
-        """
-        self.__args = _build_parser().parse_args()
 
-    @property
-    def score(self) -> float:
-        """Return the target mean score threshold supplied via ``--score``.
+def _parse_pipeline_config() -> PipelineConfig:
+    """Parse command-line arguments into a typed pipeline configuration."""
+    values: dict[str, Any] = vars(_build_parser().parse_args())
+    return PipelineConfig(**values)
 
-        Returns:
-            float: Target mean score threshold.
-        """
-        return self.__args.score
 
-    @property
-    def iterations(self) -> int:
-        """Return the maximum number of refinement passes.
-
-        Returns:
-            int: Value supplied via ``--iterations``.
-        """
-        return self.__args.iterations
-
-    @property
-    def stagnation(self) -> int:
-        """Return the maximum consecutive non-improving iterations.
-
-        Returns:
-            int: Value supplied via ``--stagnation``.
-        """
-        return self.__args.stagnation
-
-    @property
-    def thread_id(self) -> str:
-        """Return the LangGraph checkpoint thread ID.
-
-        Returns:
-            str: Value supplied via ``--thread-id``.
-        """
-        return self.__args.thread_id
-
-    @property
-    def checkpoint_db(self) -> str:
-        """Return the SQLite checkpoint database path.
-
-        Returns:
-            str: Value supplied via ``--checkpoint-db``.
-        """
-        return self.__args.checkpoint_db
-
-    @property
-    def dataset_token_multiplier(self) -> float:
-        """Return the dataset-generation token multiplier.
-
-        Returns:
-            float: Value supplied via ``--dataset-token-multiplier``.
-        """
-        return self.__args.dataset_token_multiplier
-
-    @property
-    def solution_token_multiplier(self) -> float:
-        """Return the solution-generation token multiplier.
-
-        Returns:
-            float: Value supplied via ``--solution-token-multiplier``.
-        """
-        return self.__args.solution_token_multiplier
-
-    @property
-    def evaluation_token_multiplier(self) -> float:
-        """Return the evaluation token multiplier.
-
-        Returns:
-            float: Value supplied via ``--evaluation-token-multiplier``.
-        """
-        return self.__args.evaluation_token_multiplier
-
-    @property
-    def refinement_token_multiplier(self) -> float:
-        """Return the criteria-refinement token multiplier.
-
-        Returns:
-            float: Value supplied via ``--refinement-token-multiplier``.
-        """
-        return self.__args.refinement_token_multiplier
-
-    @property
-    def max_token_corrections(self) -> int:
-        """Return the maximum automatic max-token corrections.
-
-        Returns:
-            int: Value supplied via ``--max-token-corrections``.
-        """
-        return self.__args.max_token_corrections
+def _run_cli(config: PipelineConfig) -> RunResult:
+    """Adapt CLI-only configuration and invoke the reusable pipeline API."""
+    return main(
+        score_threshold=config.score_threshold,
+        max_iterations=config.max_iterations,
+        max_stagnation=config.max_stagnation,
+        thread_id=config.thread_id,
+        checkpoint_db=config.checkpoint_db,
+        dataset_token_multiplier=config.dataset_token_multiplier,
+        solution_token_multiplier=config.solution_token_multiplier,
+        evaluation_token_multiplier=config.evaluation_token_multiplier,
+        refinement_token_multiplier=config.refinement_token_multiplier,
+        max_token_corrections=config.max_token_corrections,
+        demo_mode=config.demo_mode,
+        runs_root=config.runs_root,
+        resume_run_id=config.resume_run_id,
+        download_link_provider=_cli_download_link_provider(config.download_base_url),
+    )
 
 
 if __name__ == "__main__":
-    args = PipelineArgs()
-    main(
-        score_threshold=args.score,
-        max_iterations=args.iterations,
-        max_stagnation=args.stagnation,
-        thread_id=args.thread_id,
-        checkpoint_db=args.checkpoint_db,
-        dataset_token_multiplier=args.dataset_token_multiplier,
-        solution_token_multiplier=args.solution_token_multiplier,
-        evaluation_token_multiplier=args.evaluation_token_multiplier,
-        refinement_token_multiplier=args.refinement_token_multiplier,
-        max_token_corrections=args.max_token_corrections,
-    )
+    _run_cli(_parse_pipeline_config())

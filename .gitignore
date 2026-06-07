@@ -16,4 +16,6 @@ wheels/
 *.sqlite-wal
 
 
-refined_*.json
+/refined_*.json
+/demo_*.json
+/runs/

@@ -1,0 +1,140 @@
+[
+    {
+        "score": 10,
+        "strengths": [
+            "Fully satisfies all type-checking and validation criteria: raises TypeError for None/non-string inputs, catches json.JSONDecodeError and re-raises as ValueError, validates parsed result is a dict, checks for 'Resources' key presence, and validates 'Resources' is a dict",
+            "Correctly handles the edge case of an empty 'Resources' dict by returning an empty list without raising an exception",
+            "Includes a comprehensive docstring covering input format, return value, and all exception conditions with their triggers"
+        ],
+        "weaknesses": [
+            "Minor: the error message for TypeError could be slightly more descriptive (e.g., mentioning None explicitly), though it still satisfies the criteria",
+            "The function does not handle the case where Resources values might be non-dict entries (e.g., malformed resource definitions), but this is outside the stated requirements",
+            "No unit tests or usage examples are included in the docstring, though this was not required by the criteria"
+        ],
+        "task": "Parse an AWS CloudFormation template in JSON format and extract all resource logical IDs"
+    },
+    {
+        "score": 5.5,
+        "strengths": [
+            "Includes a comprehensive docstring that documents all rules including the IPv4 note and clarifies False is returned (not exception raised)",
+            "Uses regex as the single authoritative length enforcement mechanism without a redundant len() check",
+            "Correctly handles the simple case of all-alphanumeric bucket names via the second alternation"
+        ],
+        "weaknesses": [
+            "The regex has a length enforcement flaw: the first alternation `[a-z0-9][a-z0-9-]{1,61}[a-z0-9]` requires exactly 3-63 chars but the middle part `{1,61}` means minimum 3 total which is correct, however a 2-character name like 'ab' would match the second alternation `[a-z0-9]{3,63}` only if length>=3, so 'ab' correctly fails \u2014 but the two alternations create redundancy and complexity that could mask edge cases",
+            "The consecutive hyphen check `(?!.*--)` is a lookahead applied globally but the second alternation `^[a-z0-9]{3,63}$` doesn't allow hyphens at all, creating redundant logic; more critically, a name like 'a-b' (3 chars) would need to match the first alternation requiring middle `{1,61}` chars meaning minimum length 3 with anchors \u2014 'a-b' has middle '-' which is 1 char so it matches correctly, but the split regex approach is fragile and harder to verify",
+            "The two-alternation approach is unnecessarily complex and the criteria explicitly warn against redundant validation logic; a single unified pattern like `^(?!.*--)[a-z0-9]([a-z0-9-]{1,61}[a-z0-9])?$` with proper length handling would be cleaner and more correct"
+        ],
+        "task": "Write a Python function to validate AWS S3 bucket names according to AWS naming rules"
+    },
+    {
+        "score": 10,
+        "strengths": [
+            "Regex pattern correctly handles all three AWS partitions (aws, aws-us-gov, aws-cn) with proper anchoring and capture groups for account ID (12 digits) and role name (valid chars, 1-64 length)",
+            "The match_arn function uses the exact required guard clause `if arn is None or arn == ''` returning None for both cases without raising exceptions",
+            "All required assertions are present and correct: 3 valid ARN examples across partitions with capture group verification, 3 invalid ARN examples, exact 64-char boundary test, 65-char rejection test, and all-special-characters role name test"
+        ],
+        "weaknesses": [
+            "No additional edge case testing such as whitespace-only strings or ARNs with path prefixes in role names (e.g. role/path/rolename), though these are not required by the criteria",
+            "The solution could benefit from named capture groups for better readability and maintainability (e.g. (?P<account_id>[0-9]{12}))",
+            "Minor: no docstring or comments explaining the regex pattern components, which would aid maintainability"
+        ],
+        "task": "Create a regex pattern to match valid AWS IAM role ARNs"
+    },
+    {
+        "score": 9.5,
+        "strengths": [
+            "Correctly implements all type checking and ValueError raising with descriptive messages, including the None check before isinstance check",
+            "Uses str(i) explicitly for list index conversion as required, not f-string formatting",
+            "Depth guard correctly uses depth >= max_depth condition, matching the exact specification"
+        ],
+        "weaknesses": [
+            "The docstring example shows the function being called without the max_depth parameter but doesn't demonstrate the depth-limit behavior inline, though the separate 'Depth-limit behavior' section covers it adequately",
+            "Minor: the _flatten function is called with depth=0 on the root dict, meaning the first level of keys is processed at depth=0 and raises at depth>=20, which is correct but could be more explicitly documented in the docstring"
+        ],
+        "task": "Write a Python function to convert AWS EC2 instance metadata JSON response into a flattened dictionary with dot-notation keys"
+    },
+    {
+        "score": 8.5,
+        "strengths": [
+            "Correctly uses a capture group wrapping the full key pattern, so findall returns the matched key IDs directly via group(1) semantics",
+            "Covers all four required prefixes (AKIA, ASIA, AROA, AIDA) using a non-capturing alternation group, and matches exactly 16 uppercase alphanumeric characters after the prefix for a total of 20 characters",
+            "Uses re.ASCII flag explicitly and word boundary assertions (\\b) on both sides, satisfying the boundary and ASCII-enforcement requirements"
+        ],
+        "weaknesses": [
+            "Does not include a comment or assertion explicitly documenting the absence of re.IGNORECASE, which the criteria requires to be enforced and documented",
+            "No input validation or type checking on the text parameter (e.g., non-string input would raise an AttributeError from findall)",
+            "Missing docstring or inline comments explaining the pattern structure, making maintainability and auditability harder for security-sensitive code"
+        ],
+        "task": "Create a regex pattern to extract AWS access key IDs from logs or configuration files"
+    },
+    {
+        "score": 9.5,
+        "strengths": [
+            "All validation criteria are met in the correct order: None check first, then bool rejection, then int type check, then range validation with the correctly commented MAX_TIMESTAMP_MS constant",
+            "Docstring is complete with parameter description, return value, exceptions, and a runnable doctest example that demonstrates correct usage",
+            "Conversion uses datetime.fromtimestamp with timezone.utc and strftime with the exact ISO 8601 format string '%Y-%m-%dT%H:%M:%SZ' as specified"
+        ],
+        "weaknesses": [
+            "The doctest example output '2021-06-15T12:30:00Z' should be verified against the actual UTC conversion of 1623760200000 ms (which is 1623760200 seconds = 2021-06-15T12:30:00Z \u2014 this appears correct, but timezone-dependent execution environments could theoretically affect results if fromtimestamp behaved differently, though tz=timezone.utc mitigates this)",
+            "Minor style note: MAX_TIMESTAMP_MS is defined inside the function body rather than as a module-level constant, which is a minor organizational preference but not a functional issue"
+        ],
+        "task": "Write a Python function to parse AWS CloudWatch log timestamps and convert them to a human-readable format"
+    },
+    {
+        "score": 9.5,
+        "strengths": [
+            "All required fields (FunctionName, Runtime, Handler, Role) are present with correct patterns, maxLength constraints, and data types matching the specification exactly",
+            "Environment Variables correctly uses both propertyNames with pattern constraint AND additionalProperties:false alongside patternProperties, plus maxProperties:128 \u2014 satisfying the strict enforcement requirement",
+            "Schema correctly declares draft-07 and avoids draft-2019-09+ keywords; VpcConfig, EphemeralStorage, Timeout, and MemorySize all meet their specified constraints precisely"
+        ],
+        "weaknesses": [
+            "The patternProperties key in Variables uses the same pattern as propertyNames, but with additionalProperties:false present, the patternProperties is redundant (though not incorrect) \u2014 a minor style issue",
+            "Runtime enum could potentially be missing some edge-case runtimes (e.g., nodejs14.x or python3.7 for legacy support), though the listed values cover all current AWS runtimes well",
+            "No description fields or title annotations are included, which while not required by the criteria, would improve schema usability and documentation"
+        ],
+        "task": "Create a JSON schema that validates the structure of an AWS Lambda function configuration object"
+    },
+    {
+        "score": 8.5,
+        "strengths": [
+            "Correctly implements all required DynamoDB type support (S, N, BOOL) with proper float conversion for N type comparisons",
+            "Comprehensive input validation with appropriate ValueError raises for None items, non-dict elements, and invalid attribute_name",
+            "Raises ValueError for unsupported DynamoDB types in extract_dynamodb_value, preventing accidental None matches"
+        ],
+        "weaknesses": [
+            "The attribute_name validation order is slightly flawed: `attribute_name is None` check comes after `isinstance(attribute_name, str)` which already handles None, but more critically the None check is redundant and placed after the isinstance check rather than before it",
+            "The condition_value comparison logic for N types works but is overly verbose - the two branches of the float/float comparison and the else branch do the same thing (==), making the code unnecessarily complex",
+            "Missing type hints use the older-style `list[dict]` which requires Python 3.9+; no explicit mention of this requirement, and the docstring could be more explicit about the behavior when condition_value is a numeric string vs number"
+        ],
+        "task": "Write a Python function to filter AWS DynamoDB table items based on a simple attribute condition"
+    },
+    {
+        "score": 7.5,
+        "strengths": [
+            "Uses a named capture group (?P<region>...) correctly anchored to \\.amazonaws\\.com suffix, satisfying the structural anchoring requirement",
+            "Pattern [a-z]+-(?:[a-z]+-)+\\d+ flexibly handles both standard regions (us-east-1) and GovCloud three-segment regions (us-gov-west-1) without hardcoding character counts",
+            "Uses fixed-width lookbehind alternative via (?:^|\\.) non-capturing group instead of variable-width lookbehind, complying with Python re module constraints"
+        ],
+        "weaknesses": [
+            "The (?:^|\\.) prefix is not a lookbehind \u2014 it actually consumes the leading dot or start-of-string character, meaning the captured region group is correct but the match object includes the preceding dot, which could cause issues if the full match is used rather than just the named group",
+            "Pattern [a-z]+-(?:[a-z]+-)+\\d+ requires at least two letter segments before the digit (e.g., 'us-east-1' works but technically requires the middle group to match at least once), which may be overly restrictive for hypothetical future region formats, though it works for all current AWS regions",
+            "The (?:^|\\.) anchor could potentially match regions at the start of a string without a preceding dot, which is an edge case that may not reflect real AWS endpoint URLs and could theoretically allow false positives in non-URL strings"
+        ],
+        "task": "Create a regex pattern to match and extract AWS region codes from various AWS service endpoints"
+    },
+    {
+        "score": 9.2,
+        "strengths": [
+            "Correctly implements all 7 storage classes with proper minimum billable sizes, metadata overhead for GLACIER, and prorated minimum duration logic that simplifies to 1.0 multiplier as specified",
+            "Pricing constants block is clearly organized at the top with a last-verified date comment, and INTELLIGENT_TIERING correctly uses $0.0025/1000 per object rather than a flat $0.0025 fee",
+            "Input validation raises ValueError for both negative size_bytes and unrecognized storage_class values, and result is rounded to 10 decimal places as required"
+        ],
+        "weaknesses": [
+            "STANDARD tiered pricing uses TB = 1024^4 bytes (binary tebibytes) rather than the conventional 1TB = 1,000,000,000,000 bytes (decimal terabytes) that AWS uses for billing thresholds, which could cause incorrect tier boundary calculations",
+            "INTELLIGENT_TIERING does not apply the 128KB minimum billable size \u2014 while the criteria don't explicitly require it for this class, AWS does enforce it in practice, and the criteria's silence on it is ambiguous",
+            "The monitoring fee comment could be more explicit that it represents exactly one object's share; the inline comment 'per object per month' is present but the criteria asked to document the assumption more clearly in a dedicated comment"
+        ],
+        "task": "Write a Python function to calculate AWS S3 storage costs based on object size and storage class"
+    }
+]

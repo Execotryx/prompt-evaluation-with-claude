@@ -1,0 +1,42 @@
+[
+    {
+        "task": "Parse an AWS CloudFormation template in JSON format and extract all resource logical IDs",
+        "solution_criteria": "The JSON parser should read a CloudFormation template and return an array of all logical IDs of resources defined in the Resources section"
+    },
+    {
+        "task": "Write a Python function to validate AWS S3 bucket names according to AWS naming rules",
+        "solution_criteria": "The function should accept a string and return True if it follows S3 bucket naming conventions (3-63 characters, lowercase letters/numbers/hyphens, starts and ends with letter/number), False otherwise"
+    },
+    {
+        "task": "Create a regex pattern to match valid AWS IAM role ARNs",
+        "solution_criteria": "The regex should match ARNs in the format arn:aws:iam::account-id:role/role-name and capture the account ID and role name separately"
+    },
+    {
+        "task": "Write a Python function to convert AWS EC2 instance metadata JSON response into a flattened dictionary with dot-notation keys",
+        "solution_criteria": "The function should take nested JSON metadata and return a flat dictionary where nested keys are joined with dots (e.g., 'network.interfaces.0.mac')"
+    },
+    {
+        "task": "Create a regex pattern to extract AWS access key IDs from logs or configuration files",
+        "solution_criteria": "The regex should match the pattern of AWS access keys (AKIA followed by 16 alphanumeric characters) and capture the full key"
+    },
+    {
+        "task": "Write a Python function to parse AWS CloudWatch log timestamps and convert them to a human-readable format",
+        "solution_criteria": "The function should accept a Unix timestamp in milliseconds and return a formatted datetime string in ISO 8601 format"
+    },
+    {
+        "task": "Create a JSON schema that validates the structure of an AWS Lambda function configuration object",
+        "solution_criteria": "The JSON schema should define required fields like FunctionName, Runtime, Handler, Role, and validate their data types and format"
+    },
+    {
+        "task": "Write a Python function to filter AWS DynamoDB table items based on a simple attribute condition",
+        "solution_criteria": "The function should accept a list of item dictionaries and a condition (attribute name and value) and return only items matching that condition"
+    },
+    {
+        "task": "Create a regex pattern to match and extract AWS region codes from various AWS service endpoints",
+        "solution_criteria": "The regex should identify region codes (like us-east-1, eu-west-2) from AWS endpoint URLs and capture the region separately"
+    },
+    {
+        "task": "Write a Python function to calculate AWS S3 storage costs based on object size and storage class",
+        "solution_criteria": "The function should accept object size in bytes and storage class name, then return the monthly cost based on current AWS pricing tiers"
+    }
+]

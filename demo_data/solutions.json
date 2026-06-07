@@ -1,0 +1,42 @@
+[
+    {
+        "task": "Parse an AWS CloudFormation template in JSON format and extract all resource logical IDs",
+        "solution": "import json\n\ndef extract_logical_ids(template_str):\n    template = json.loads(template_str)\n    return list(template.get('Resources', {}).keys())\n"
+    },
+    {
+        "task": "Write a Python function to validate AWS S3 bucket names according to AWS naming rules",
+        "solution": "import re\n\ndef validate_s3_bucket_name(name):\n    return bool(re.match(r'^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$', name)) and len(name) <= 63"
+    },
+    {
+        "task": "Create a regex pattern to match valid AWS IAM role ARNs",
+        "solution": "import re\n\npattern = r'^arn:aws:iam::(?P<account_id>\\d{12}):role/(?P<role_name>[\\w+=,.@-]+)$'\n\ndef match_arn(arn):\n    return re.match(pattern, arn)\n"
+    },
+    {
+        "task": "Write a Python function to convert AWS EC2 instance metadata JSON response into a flattened dictionary with dot-notation keys",
+        "solution": "def flatten_metadata(data, prefix=''):\n    result = {}\n    if isinstance(data, dict):\n        for key, value in data.items():\n            new_key = f\"{prefix}.{key}\" if prefix else key\n            result.update(flatten_metadata(value, new_key))\n    elif isinstance(data, list):\n        for i, value in enumerate(data):\n            new_key = f\"{prefix}.{i}\" if prefix else str(i)\n            result.update(flatten_metadata(value, new_key))\n    else:\n        result[prefix] = data\n    return result"
+    },
+    {
+        "task": "Create a regex pattern to extract AWS access key IDs from logs or configuration files",
+        "solution": "import re\n\npattern = re.compile(r'AKIA[A-Z0-9]{16}')\n"
+    },
+    {
+        "task": "Write a Python function to parse AWS CloudWatch log timestamps and convert them to a human-readable format",
+        "solution": "from datetime import datetime, timezone\n\ndef parse_cloudwatch_timestamp(ms: int) -> str:\n    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()"
+    },
+    {
+        "task": "Create a JSON schema that validates the structure of an AWS Lambda function configuration object",
+        "solution": "{\"$schema\":\"http://json-schema.org/draft-07/schema#\",\"title\":\"AWS Lambda Function Configuration\",\"type\":\"object\",\"required\":[\"FunctionName\",\"Runtime\",\"Handler\",\"Role\"],\"properties\":{\"FunctionName\":{\"type\":\"string\",\"minLength\":1,\"maxLength\":64,\"pattern\":\"^[a-zA-Z0-9-_]+$\"},\"Runtime\":{\"type\":\"string\",\"enum\":[\"nodejs18.x\",\"nodejs20.x\",\"python3.9\",\"python3.10\",\"python3.11\",\"python3.12\",\"java11\",\"java17\",\"java21\",\"dotnet6\",\"dotnet8\",\"ruby3.2\",\"provided.al2\",\"provided.al2023\"]},\"Handler\":{\"type\":\"string\",\"minLength\":1,\"pattern\":\"^[^\\\\s]+$\"},\"Role\":{\"type\":\"string\",\"pattern\":\"^arn:aws:iam::[0-9]{12}:role/[a-zA-Z0-9+=,.@_/-]+$\"},\"Description\":{\"type\":\"string\",\"maxLength\":256},\"Timeout\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":900},\"MemorySize\":{\"type\":\"integer\",\"minimum\":128,\"maximum\":10240,\"multipleOf\":64},\"Environment\":{\"type\":\"object\",\"properties\":{\"Variables\":{\"type\":\"object\",\"additionalProperties\":{\"type\":\"string\"}}},\"additionalProperties\":false},\"Tags\":{\"type\":\"object\",\"additionalProperties\":{\"type\":\"string\"}},\"Layers\":{\"type\":\"array\",\"items\":{\"type\":\"string\",\"pattern\":\"^arn:aws:lambda:[a-z0-9-]+:[0-9]{12}:layer:[a-zA-Z0-9-_]+:[0-9]+$\"},\"maxItems\":5},\"VpcConfig\":{\"type\":\"object\",\"properties\":{\"SubnetIds\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"SecurityGroupIds\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"SubnetIds\",\"SecurityGroupIds\"]}},\"additionalProperties\":false}"
+    },
+    {
+        "task": "Write a Python function to filter AWS DynamoDB table items based on a simple attribute condition",
+        "solution": "def filter_items(items, attr, value):\n    return [item for item in items if item.get(attr) == value]"
+    },
+    {
+        "task": "Create a regex pattern to match and extract AWS region codes from various AWS service endpoints",
+        "solution": "import re\n\npattern = r'(?:^|\\.)([a-z]{2}-(?:east|west|north|south|central|northeast|northwest|southeast|southwest)-\\d+)\\.'\n\nendpoints = [\n    's3.us-east-1.amazonaws.com',\n    'ec2.eu-west-2.amazonaws.com',\n    'lambda.ap-southeast-1.amazonaws.com',\n    'dynamodb.us-west-2.amazonaws.com',\n    'sqs.eu-central-1.amazonaws.com',\n]\n\nfor endpoint in endpoints:\n    match = re.search(pattern, endpoint)\n    if match:\n        print(f'Endpoint: {endpoint} => Region: {match.group(1)}')\n"
+    },
+    {
+        "task": "Write a Python function to calculate AWS S3 storage costs based on object size and storage class",
+        "solution": "def calculate_s3_cost(size_bytes, storage_class):\n    size_gb = size_bytes / (1024 ** 3)\n    \n    pricing = {\n        'STANDARD': [(50, 0.023), (450, 0.022), (float('inf'), 0.021)],\n        'INTELLIGENT_TIERING': [(50, 0.023), (450, 0.022), (float('inf'), 0.021)],\n        'STANDARD_IA': [(float('inf'), 0.0125)],\n        'ONEZONE_IA': [(float('inf'), 0.01)],\n        'GLACIER': [(float('inf'), 0.004)],\n        'GLACIER_DEEP_ARCHIVE': [(float('inf'), 0.00099)],\n        'REDUCED_REDUNDANCY': [(float('inf'), 0.024)],\n    }\n    \n    if storage_class not in pricing:\n        raise ValueError(f\"Unknown storage class: {storage_class}\")\n    \n    tiers = pricing[storage_class]\n    cost = 0.0\n    remaining = size_gb\n    prev_limit = 0\n    \n    for limit, rate in tiers:\n        if remaining <= 0:\n            break\n        tier_size = min(remaining, limit - prev_limit)\n        cost += tier_size * rate\n        remaining -= tier_size\n        prev_limit = limit\n    \n    return cost"
+    }
+]

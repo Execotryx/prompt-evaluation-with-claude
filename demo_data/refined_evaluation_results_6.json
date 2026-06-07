@@ -1,0 +1,142 @@
+[
+    {
+        "score": 9.8,
+        "strengths": [
+            "All type validation branches are correctly implemented with exact error messages matching the criteria, including the dedicated `if template_str is None` and `elif not isinstance(template_str, str)` branches",
+            "JSON error handling uses `ValueError` with 'Malformed JSON' (contains 'malformed' but not 'invalid') and references 'JSON', satisfying the mutual exclusivity requirement",
+            "Docstring is comprehensive with proper Args/Returns/Raises sections and includes all three required doctest examples: normal case, empty Resources, and None input error case"
+        ],
+        "weaknesses": [
+            "The error message for malformed JSON uses 'Malformed' (capitalized) rather than lowercase 'malformed', which is a minor stylistic inconsistency but does satisfy the criteria since the word 'malformed' is present",
+            "The ValueError message for non-dict top-level structure ('The top-level structure must be a JSON object') is correct but could be slightly more explicit about what was received instead",
+            "No edge case handling for extremely large templates or non-standard CloudFormation structures, though these are outside the stated criteria"
+        ],
+        "task": "Parse an AWS CloudFormation template in JSON format and extract all resource logical IDs"
+    },
+    {
+        "score": 9.5,
+        "strengths": [
+            "Uses exactly one regex pattern variable referenced directly in re.fullmatch with no redundant anchors (^ or $), satisfying the anchoring requirement",
+            "Pattern (?!.*--)[a-z0-9][a-z0-9-]{1,61}[a-z0-9] correctly enforces all constraints in a single unified pattern: 3-63 char length, start/end with alphanumeric, no consecutive hyphens, no dots, lowercase only",
+            "Docstring comprehensively lists all enforced rules, explicitly states dots are forbidden making IPv4 impossible, and states the function returns False rather than raising exceptions"
+        ],
+        "weaknesses": [
+            "The try/except block is unnecessary since re.fullmatch with a valid static pattern and any input (including non-string types) won't raise exceptions in normal usage \u2014 it adds slight redundancy though it doesn't violate any explicit rule",
+            "Minor: the try/except could mask genuine programming errors, though the criteria only require never raising exceptions for any input, which this satisfies",
+            "No substantive weaknesses \u2014 the solution is essentially a perfect implementation of the specified criteria"
+        ],
+        "task": "Write a Python function to validate AWS S3 bucket names according to AWS naming rules"
+    },
+    {
+        "score": 8.5,
+        "strengths": [
+            "All three AWS partitions (aws, aws-us-gov, aws-cn) are correctly handled with an intentionally unnamed non-capturing group, satisfying the partition alternation requirement",
+            "All required assertions are present and correct: valid/invalid ARNs across partitions, named capture group value checks, boundary tests for 64/65 char role names, special characters, None/empty/whitespace guards, and path prefix rejection",
+            "Input guards use the exact required patterns (arn is None or arn == '' and arn.strip() == '') and the regex uses re.VERBOSE with inline comments labeling all three required elements including the note about / exclusion"
+        ],
+        "weaknesses": [
+            "The regex uses re.match() which anchors at the start but the pattern has a $ anchor at the end \u2014 however there is no ^ anchor explicitly stated, and re.match() only anchors at the start implicitly; a more robust solution would use re.fullmatch() or add an explicit ^ anchor to make intent clearer",
+            "The top-level docstring/comment block is implemented as a comment inside the regex pattern string rather than a proper module-level docstring or function-level docstring, which is a minor deviation from the criterion specifying 'a top-level docstring or comment block'",
+            "The solution lacks a dedicated docstring for the match_arn function explaining its purpose and return values, which would improve code quality and documentation completeness"
+        ],
+        "task": "Create a regex pattern to match valid AWS IAM role ARNs"
+    },
+    {
+        "score": 7.5,
+        "strengths": [
+            "Correctly implements type validation, JSON parsing with explicit json.loads(), and ValueError raising for invalid inputs before any processing",
+            "Properly uses str(i) explicitly for list index conversion (not f-string), satisfying that specific requirement",
+            "Comprehensive docstring with parameters, return type, exceptions, depth semantics, and two usage examples"
+        ],
+        "weaknesses": [
+            "Non-dict list items use 'if depth >= max_depth' check which is redundant (already checked at top of _flatten) and semantically inconsistent \u2014 the depth guard for non-dict list items should arguably use depth+1 >= max_depth to match the criteria's intent of 'consistent depth enforcement for all value types'; the criteria states non-dict list items must also be checked against the depth guard before being added, implying the same depth+1 threshold as dict items",
+            "The docstring example for the deep nesting ValueError case has a syntax error \u2014 the dict literal has mismatched braces (extra closing braces), making it not 'syntactically valid and executable without errors' as required",
+            "When recursing into dict values, the depth guard at the top of _flatten handles the check, but for list items containing dicts, the check uses 'depth + 1 >= max_depth' before calling _flatten with depth+1, which is correct; however the inconsistency between dict-value recursion (checked inside _flatten) vs list-dict recursion (checked before calling) creates subtle behavioral differences"
+        ],
+        "task": "Write a Python function to convert AWS EC2 instance metadata JSON response into a flattened dictionary with dot-notation keys"
+    },
+    {
+        "score": 10,
+        "strengths": [
+            "All four AWS key prefixes (AKIA, ASIA, AROA, AIDA) are included in a non-capturing alternation group, with a capture group wrapping the full 20-character key pattern, satisfying the group(1) requirement",
+            "re.ASCII flag is explicitly set and re.IGNORECASE is explicitly omitted with the required inline comment on the same line as re.compile, exactly as specified",
+            "Input type validation raises TypeError with type(text).__name__ formatting, word boundaries \\b are on both sides, the docstring covers all five required elements including a usage example, and findall returns all non-overlapping matches"
+        ],
+        "weaknesses": [
+            "The docstring uses a raw string escape (\\\\b) for the backslash in the re.ASCII explanation, which renders as \\b in plain text but could be written more cleanly as a raw docstring or with a single backslash",
+            "The non-capturing group (?:AKIA|ASIA|AROA|AIDA) adds slight verbosity; a character-class approach like [AR][KSI][IO][AA] is not used, but the alternation is perfectly correct and readable",
+            "No edge-case handling or logging is present, though none was strictly required by the criteria"
+        ],
+        "task": "Create a regex pattern to extract AWS access key IDs from logs or configuration files"
+    },
+    {
+        "score": 9.8,
+        "strengths": [
+            "All validation checks are implemented in the correct order: None first, then bool, then int type check, then range checks \u2014 exactly as specified",
+            "All three required doctest examples are present directly in the docstring body (not under a named heading), making them discoverable by doctest.testmod() without additional configuration",
+            "Module-level MAX_TIMESTAMP_MS constant is defined with the required inline comment, and the conversion uses datetime.fromtimestamp with tz=timezone.utc and strftime with the exact required format string"
+        ],
+        "weaknesses": [
+            "The docstring uses reStructuredText style (:param:, :type:, :returns:, :rtype:, :raises:) which is acceptable, but the doctest examples appear after the :raises: directives rather than before them \u2014 while this still works with doctest.testmod(), placing examples after field lists is slightly unconventional and could cause issues with some docstring parsers",
+            "Minor: the ValueError message for negative values could include the actual value received for better debuggability, though this is not required by the criteria",
+            "No substantive weaknesses \u2014 the solution satisfies all stated criteria accurately and completely"
+        ],
+        "task": "Write a Python function to parse AWS CloudWatch log timestamps and convert them to a human-readable format"
+    },
+    {
+        "score": 8.5,
+        "strengths": [
+            "Correctly implements all required fields (FunctionName, Runtime, Handler, Role) with proper patterns, types, and constraints matching AWS specifications",
+            "Runtime enum includes both current and legacy/deprecated runtimes (nodejs14.x, python3.7, python3.8, java11, etc.) as required",
+            "Environment Variables correctly uses propertyNames with only the 'pattern' keyword (no description inside propertyNames), combined with additionalProperties for value typing, and maxProperties:128 \u2014 satisfying the strict propertyNames requirements"
+        ],
+        "weaknesses": [
+            "The propertyNames schema contains only 'pattern' which is correct, but the solution uses both propertyNames AND additionalProperties:{type:string} for the Variables object \u2014 while not explicitly prohibited, the criteria states to use propertyNames as 'sole enforcement mechanism OR combine patternProperties with additionalProperties:false', and using additionalProperties with a schema (not false) alongside propertyNames is a slight deviation from the clean enforcement model described",
+            "The additionalProperties on Variables includes a 'description' field on the string schema, which is minor but adds annotation inside what should be a clean validation schema for values",
+            "Missing some potentially expected runtime values like nodejs16.x deprecation status clarity, though the enum coverage is otherwise comprehensive \u2014 this is a very minor concern given the broad coverage provided"
+        ],
+        "task": "Create a JSON schema that validates the structure of an AWS Lambda function configuration object"
+    },
+    {
+        "score": 7.5,
+        "strengths": [
+            "Correctly uses List[Dict] from typing module for Python 3.8+ compatibility, satisfying the type hints requirement",
+            "Input validation order is correct: checks items is None first, then iterates to raise on first non-dict element, then checks isinstance(attribute_name, str) before empty string check \u2014 no redundant None check before isinstance",
+            "_extract_value raises ValueError with descriptive message for both empty typed dict and unsupported types, preventing None equality matches"
+        ],
+        "weaknesses": [
+            "The _extract_value helper returns the raw string value for 'N' type rather than a float, then the float conversion is done in the main function \u2014 this is functionally correct but the criteria implies the helper should extract the value and the N comparison uses float(stored)==float(condition_value) which it does, so this is acceptable; however the helper redundantly calls next(iter(typed_dict)) again in the main function after already calling _extract_value, which is slightly inefficient and inelegant",
+            "The items validation iterates the full list before processing, which satisfies 'raise immediately upon finding the first violation' since it uses a for loop with isinstance check and raises on first failure \u2014 this is correct, but the solution does a full pre-pass validation loop then a second loop for filtering, meaning large lists are iterated twice",
+            "The docstring documents condition_value coercion to float for N type comparisons but could be slightly more explicit that this applies regardless of whether condition_value is already a number or numeric string, though it does state 'may be a number or a numeric string'"
+        ],
+        "task": "Write a Python function to filter AWS DynamoDB table items based on a simple attribute condition"
+    },
+    {
+        "score": 9.2,
+        "strengths": [
+            "Uses fixed-width lookbehind (?<=\\.) correctly to anchor region after a dot without consuming it, satisfying Python re module compatibility",
+            "Named capture group (?P<region>...) with pattern [a-z]+-(?:[a-z]+-)*\\d+ correctly uses * quantifier for optional middle segments, matching us-1, us-east-1, and us-gov-west-1 as required",
+            "Anchors region to \\.amazonaws\\.com(?:/|$) suffix, preventing false positives from service names or bucket subdomains and making structural intent explicit"
+        ],
+        "weaknesses": [
+            "The (?:/|$) suffix anchor may cause missed matches in re.findall on URLs with query strings or fragments after the path (e.g., .amazonaws.com?query), though this is an edge case not mentioned in the criteria",
+            "The pattern requires at least two letter segments (e.g., [a-z]+-(?:[a-z]+-)*) before the digit, meaning a hypothetical single-segment region like 'us-1' would actually match since [a-z]+- covers 'us-' and (?:[a-z]+-)* covers zero repetitions \u2014 this is correct but the pattern structure could be more clearly documented",
+            "No explicit anchoring prevents matching within longer hostnames where a subdomain happens to precede a valid region pattern, though the lookbehind dot requirement mitigates most such cases"
+        ],
+        "task": "Create a regex pattern to match and extract AWS region codes from various AWS service endpoints"
+    },
+    {
+        "score": 8.2,
+        "strengths": [
+            "Correct input validation order (TypeError before ValueError, non-finite before negative), proper error messages, and all 7 storage classes supported",
+            "Tiered STANDARD pricing uses correct decimal TB boundaries (50\u00d710^12, 500\u00d710^12) and correct rates ($0.023/$0.022/$0.021)",
+            "INTELLIGENT_TIERING comment block correctly states all three required points including the exact $0.0000025 per-object monitoring fee (not $0.0025 flat)"
+        ],
+        "weaknesses": [
+            "GLACIER_INSTANT_RETRIEVAL rate is set to $0.004/GB but the actual AWS rate is $0.004/GB \u2014 however the criteria specifies this rate is correct, yet the constant name GLACIER_INSTANT_RATE shares the same value as GLACIER_RATE which could cause confusion; more critically, the GLACIER_DEEP_ARCHIVE_RATE is $0.00099/GB whereas AWS public pricing is $0.00099/GB \u2014 this appears correct but should be verified",
+            "GLACIER cost formula uses `max(size_bytes + 8_000, MIN_48KB)` which correctly implements the 40KB data + 8KB metadata floor, but the criteria states the formula should be `max(size_bytes + 8_000, 48_000)` \u2014 the implementation matches this exactly, so this is fine; however there is no explicit comment noting the 40KB data + 8KB metadata breakdown in the GLACIER block",
+            "The pricing constants block comment says 'last verified: 2025-01-01' which satisfies the audit requirement, but GLACIER_INSTANT_RATE ($0.004/GB) differs from the actual AWS Glacier Instant Retrieval rate of $0.004/GB per the criteria \u2014 the criteria explicitly requires $0.004/GB for GLACIER (Flexible Retrieval) but does not specify the Instant Retrieval rate, leaving it potentially incorrect at $0.004/GB vs the actual ~$0.004/GB"
+        ],
+        "task": "Write a Python function to calculate AWS S3 storage costs based on object size and storage class"
+    }
+]

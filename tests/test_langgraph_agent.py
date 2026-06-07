@@ -3,6 +3,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -44,6 +45,57 @@ class DummyClaudeClient:
 
     def ask(self, *args, **kwargs):
         raise AssertionError("Model calls should not run when cache files are present.")
+
+
+class ExplodingClaudeClient:
+    def __init__(self, *args, **kwargs):
+        raise AssertionError("Demo mode must not construct ClaudeClient.")
+
+
+class FakeConnection:
+    def close(self):
+        pass
+
+
+class FakeMainGraph:
+    def __init__(self):
+        self.checkpointer = type("FakeCheckpointer", (), {"conn": FakeConnection()})()
+
+    def invoke(self, state, config):
+        for key, payload in (
+            ("dataset_file", DATASET),
+            ("solutions_file", SOLUTIONS),
+            ("evaluation_file", results(10.0)),
+            ("best_dataset_file", DATASET),
+        ):
+            path = Path(state[key])
+            path.write_text(json.dumps(payload), encoding="utf-8")
+        return {
+            **state,
+            "stop_reason": "score_threshold",
+            "best_score": 10.0,
+            "iteration": 0,
+            "last_error": None,
+        }
+
+
+class FakeErrorGraph:
+    def __init__(self):
+        self.checkpointer = type("FakeCheckpointer", (), {"conn": FakeConnection()})()
+
+    def invoke(self, state, config):
+        return {
+            **state,
+            "stop_reason": "error",
+            "last_error": "RuntimeError: simulated failure",
+            "failed_stage": "load_or_generate_dataset",
+            "current_stage": "load_or_generate_dataset",
+        }
+
+
+class CustomDownloadLinkProvider:
+    def create_download_link(self, run_id: str, archive_path: Path) -> str:
+        return f"signed-download:{run_id}:{archive_path.name}"
 
 
 class LangGraphAgentTests(unittest.TestCase):
@@ -131,6 +183,187 @@ class LangGraphAgentTests(unittest.TestCase):
         self.assertEqual(final_state.get("stagnation_count"), 0)
         self.assertEqual(final_state.get("best_score"), 6.0)
         self.assertEqual(final_state.get("best_dataset"), refined_dataset)
+
+    def test_demo_mode_runs_full_refinement_without_claude_client(self):
+        refined_dataset = [{"task": "Task A", "solution_criteria": "Real refined criteria"}]
+        refined_results = results(8.0)
+        source_dataset = self.write_json("source_evaluation_dataset.json", DATASET)
+        source_solutions = self.write_json("source_solutions.json", SOLUTIONS)
+        source_evaluation = self.write_json("source_evaluation_results.json", results(7.0))
+        source_refined_dataset_pattern = str(self.root / "source_refined_dataset_{iteration}.json")
+        source_refined_solutions_pattern = str(self.root / "source_refined_solutions_{iteration}.json")
+        source_refined_evaluation_pattern = str(self.root / "source_refined_evaluation_results_{iteration}.json")
+        self.write_json("source_refined_dataset_1.json", refined_dataset)
+        self.write_json("source_refined_solutions_1.json", SOLUTIONS)
+        self.write_json("source_refined_evaluation_results_1.json", refined_results)
+        state: main.AgentState = {
+            "demo_mode": True,
+            "score_threshold": main.SCORE_THRESHOLD,
+            "max_iterations": 1,
+            "max_stagnation": main.MAX_STAGNATION_ITERATIONS,
+            "iteration": 0,
+            "stagnation_count": 0,
+            "token_correction_count": 0,
+            "max_token_corrections": main.MAX_TOKEN_CORRECTIONS,
+            "current_stage": "start",
+            "failed_stage": None,
+            "retry_stage": None,
+            "last_error": None,
+            "stop_reason": None,
+            "dataset_file": str(self.root / main.DEMO_DATASET_FILE),
+            "solutions_file": str(self.root / main.DEMO_SOLUTIONS_FILE),
+            "evaluation_file": str(self.root / main.DEMO_EVALUATION_FILE),
+            "best_dataset_file": str(self.root / main.DEMO_BEST_DATASET_FILE),
+            "refined_dataset_pattern": str(self.root / main.DEMO_REFINED_DATASET_PATTERN),
+            "refined_solutions_pattern": str(self.root / main.DEMO_REFINED_SOLUTIONS_PATTERN),
+            "refined_evaluation_pattern": str(self.root / main.DEMO_REFINED_EVALUATION_PATTERN),
+        }
+        graph = main.build_prompt_evaluation_agent(str(self.root / main.DEMO_CHECKPOINT_DB))
+
+        try:
+            with (
+                patch.object(main, "ClaudeClient", ExplodingClaudeClient),
+                patch.object(main, "DEMO_SOURCE_DATASET_FILE", source_dataset),
+                patch.object(main, "DEMO_SOURCE_SOLUTIONS_FILE", source_solutions),
+                patch.object(main, "DEMO_SOURCE_EVALUATION_FILE", source_evaluation),
+                patch.object(main, "DEMO_SOURCE_REFINED_DATASET_PATTERN", source_refined_dataset_pattern),
+                patch.object(main, "DEMO_SOURCE_REFINED_SOLUTIONS_PATTERN", source_refined_solutions_pattern),
+                patch.object(main, "DEMO_SOURCE_REFINED_EVALUATION_PATTERN", source_refined_evaluation_pattern),
+            ):
+                final_state = graph.invoke(state, {"configurable": {"thread_id": main.DEMO_THREAD_ID}})
+        finally:
+            graph.checkpointer.conn.close()
+
+        self.assertEqual(final_state.get("stop_reason"), "max_iterations")
+        self.assertEqual(final_state.get("iteration"), 1)
+        self.assertEqual(final_state.get("best_score"), 8.0)
+
+        for name in (
+            main.DEMO_DATASET_FILE,
+            main.DEMO_SOLUTIONS_FILE,
+            main.DEMO_EVALUATION_FILE,
+            main.DEMO_BEST_DATASET_FILE,
+            "demo_refined_dataset_1.json",
+            "demo_refined_solutions_1.json",
+            "demo_refined_evaluation_results_1.json",
+        ):
+            self.assertTrue((self.root / name).exists(), name)
+
+        for name in (
+            "evaluation_dataset.json",
+            "solutions.json",
+            "evaluation_results.json",
+            "best_dataset.json",
+            "refined_dataset_1.json",
+            "refined_solutions_1.json",
+            "refined_evaluation_results_1.json",
+        ):
+            self.assertFalse((self.root / name).exists(), name)
+
+        original_dataset = json.loads((self.root / main.DEMO_DATASET_FILE).read_text(encoding="utf-8"))
+        copied_refined_dataset = json.loads((self.root / "demo_refined_dataset_1.json").read_text(encoding="utf-8"))
+        copied_refined_results = json.loads((self.root / "demo_refined_evaluation_results_1.json").read_text(encoding="utf-8"))
+        self.assertEqual(original_dataset, DATASET)
+        self.assertEqual(copied_refined_dataset, refined_dataset)
+        self.assertEqual(copied_refined_results, refined_results)
+
+    def test_live_main_creates_isolated_downloadable_runs(self):
+        runs_root = self.root / "runs"
+        with (
+            patch.object(main, "build_prompt_evaluation_agent", side_effect=lambda checkpoint_db: FakeMainGraph()),
+            patch.object(main, "_generate_run_id", side_effect=["run-one", "run-two"]),
+        ):
+            provider = main.BaseUrlDownloadLinkProvider("https://downloads.example/runs")
+            first = main.main(runs_root=str(runs_root), download_link_provider=provider)
+            second = main.main(runs_root=str(runs_root), download_link_provider=provider)
+
+        self.assertNotEqual(first["run_directory"], second["run_directory"])
+        self.assertEqual(first["download_link"], "https://downloads.example/runs/run-one/artifacts.zip")
+        self.assertEqual(second["download_link"], "https://downloads.example/runs/run-two/artifacts.zip")
+
+        for result in (first, second):
+            run_directory = Path(result["run_directory"] or "")
+            archive_path = Path(result["archive_path"] or "")
+            self.assertEqual(run_directory.parent, runs_root.resolve())
+            self.assertTrue(archive_path.exists())
+            manifest = json.loads((run_directory / main.RUN_MANIFEST_FILE).read_text(encoding="utf-8"))
+            self.assertEqual(manifest["status"], "completed")
+            self.assertEqual(manifest["stop_reason"], "score_threshold")
+            with zipfile.ZipFile(archive_path) as archive:
+                names = set(archive.namelist())
+            self.assertIn(main.RUN_MANIFEST_FILE, names)
+            self.assertIn("best_dataset.json", names)
+            self.assertNotIn(main.DEFAULT_CHECKPOINT_DB, names)
+
+    def test_live_main_accepts_custom_download_link_provider(self):
+        runs_root = self.root / "runs"
+        with (
+            patch.object(main, "build_prompt_evaluation_agent", side_effect=lambda checkpoint_db: FakeMainGraph()),
+            patch.object(main, "_generate_run_id", return_value="custom-provider"),
+        ):
+            result = main.main(
+                runs_root=str(runs_root),
+                download_link_provider=CustomDownloadLinkProvider(),
+            )
+
+        self.assertEqual(result["download_link"], "signed-download:custom-provider:artifacts.zip")
+
+    def test_cli_download_link_provider_uses_explicit_or_environment_base_url(self):
+        explicit = main._cli_download_link_provider("https://explicit.example/runs")
+        with patch.dict(os.environ, {"DOWNLOAD_BASE_URL": "https://environment.example/runs"}):
+            environment = main._cli_download_link_provider(None)
+
+        self.assertIsNotNone(explicit)
+        self.assertIsNotNone(environment)
+        archive = self.root / main.RUN_ARCHIVE_FILE
+        self.assertEqual(
+            explicit.create_download_link("run-id", archive) if explicit else None,
+            "https://explicit.example/runs/run-id/artifacts.zip",
+        )
+        self.assertEqual(
+            environment.create_download_link("run-id", archive) if environment else None,
+            "https://environment.example/runs/run-id/artifacts.zip",
+        )
+
+    def test_live_main_resume_reuses_run_directory(self):
+        runs_root = self.root / "runs"
+        with (
+            patch.object(main, "build_prompt_evaluation_agent", side_effect=lambda checkpoint_db: FakeMainGraph()),
+            patch.object(main, "_generate_run_id", return_value="resume-me"),
+        ):
+            original = main.main(runs_root=str(runs_root))
+            resumed = main.main(runs_root=str(runs_root), resume_run_id="resume-me")
+
+        self.assertEqual(original["run_id"], resumed["run_id"])
+        self.assertEqual(original["run_directory"], resumed["run_directory"])
+
+    def test_resume_run_id_rejects_path_traversal(self):
+        with self.assertRaises(ValueError):
+            main._prepare_live_run(str(self.root / "runs"), "../outside", None)
+
+    def test_failed_live_main_archives_error_manifest(self):
+        runs_root = self.root / "runs"
+        with (
+            patch.object(main, "build_prompt_evaluation_agent", side_effect=lambda checkpoint_db: FakeErrorGraph()),
+            patch.object(main, "_generate_run_id", return_value="failed-run"),
+        ):
+            result = main.main(runs_root=str(runs_root))
+
+        run_directory = Path(result["run_directory"] or "")
+        manifest = json.loads((run_directory / main.RUN_MANIFEST_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(manifest["status"], "failed")
+        self.assertEqual(manifest["error"], "RuntimeError: simulated failure")
+        self.assertTrue(Path(result["archive_path"] or "").exists())
+
+    def test_demo_main_does_not_create_live_run_directory(self):
+        runs_root = self.root / "runs"
+        with patch.object(main, "build_prompt_evaluation_agent", side_effect=lambda checkpoint_db: FakeMainGraph()):
+            result = main.main(demo_mode=True, runs_root=str(runs_root))
+
+        self.assertIsNone(result["run_id"])
+        self.assertIsNone(result["archive_path"])
+        self.assertFalse(runs_root.exists())
 
     def test_refine_dataset_uses_best_dataset_not_current_dataset(self):
         current_dataset = [{"task": "Task A", "solution_criteria": "Current criteria"}]
